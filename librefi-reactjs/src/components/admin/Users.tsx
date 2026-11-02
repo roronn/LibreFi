@@ -50,7 +50,8 @@ function AdminUsers() {
     const [totalPages, setTotalPages] = useState(1);
 
     async function getUsers() {
-        const res = await fetch("/api/admin/users?payload=" + await encrypt(getAdminKey(), JSON.stringify({ "id": 1, page })));
+        const encryptedPayload = await encrypt(getAdminKey(), JSON.stringify({ "id": 1, page }));
+        const res = await fetch("/api/admin/users?payload=" + encodeURIComponent(encryptedPayload || ""));
         if (res.ok) {
             const json = await res.json();
             setUsers(json.users);

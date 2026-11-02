@@ -58,7 +58,7 @@ npm --version    # ≥ 9
 
 ```bash
 cd librefi-reactjs
-npm install
+npm install   # installs @noble/ciphers and refreshes npm dependency metadata
 npm run build
 cd ..
 ```
@@ -199,7 +199,7 @@ ls -lh target/<TARGET>/release/librefi
 > | **LAN** | `br-lan` | Hotspot clients — captive portal users only |
 >
 > - **SSH** into the LibreFi router is only reachable from the **WAN side** (from your main router's network).
-> - The **admin panel** (`/admin`) is blocked from the LAN side by design — clients can only see the captive portal.
+> - The **admin panel** (`/admin`) can be accessed from both LAN and WAN in this customized build. Admin API requests still require the configured `LIBREFI_KEY`. Set `LIBREFI_ADMIN_LAN=false` to restore the original LAN-side restriction.
 > - **Client isolation** on your main router **must be disabled**. If client isolation is on, devices on the main router's WiFi cannot reach the LibreFi router's WAN IP, which means you will lose SSH access and won't be able to reach the admin panel.
 >
 > To disable client isolation: go to your main router's wireless settings and turn off **"AP Isolation"**, **"Client Isolation"**, or **"Wireless Isolation"** (the name varies by router brand).
@@ -264,8 +264,12 @@ Open a browser from a device connected to the router's LAN and navigate to `http
 
 The admin panel is at `http://10.0.0.1/admin` (or your router's LAN IP).
 
-- The admin password is your `LIBREFI_KEY` value.
-- All admin API calls are encrypted with AES-256-GCM using that key.
+- The admin password is your `LIBREFI_KEY` value (minimum 16 characters).
+- All admin API calls are encrypted with AES-256-GCM using that key. The browser and Rust backend both encode the key as UTF-8, copy up to 32 bytes, and zero-pad shorter keys to 32 bytes.
+- LAN admin access is enabled by default in this customized build. Set `LIBREFI_ADMIN_LAN=false` in the process environment to restore the original LAN restriction.
+- The login page now distinguishes an incorrect key (`401`) from a LAN policy block (`403`) and other server errors, instead of displaying “Invalid admin key” for every failure.
+- Base64 encrypted query payloads are URL-encoded by the frontend before being sent to the backend.
+- The frontend uses `@noble/ciphers` for AES-GCM, so login encryption also works when the admin page is opened over plain HTTP at a private LAN IP. The browser still needs `crypto.getRandomValues` for secure nonces; modern browsers provide this API even outside HTTPS.
 - Use `admin-encryptor.html` (in the project root) to manually encrypt payloads for debugging.
 
 ---

@@ -18,6 +18,19 @@ use wifi::handle_wifi;
 
 pub const LAN_SUBNET: &str = "10.0.";
 
+/// LAN administration is enabled by default for this build. Set
+/// LIBREFI_ADMIN_LAN=false to restore the original LAN-side restriction.
+pub fn lan_admin_enabled() -> bool {
+    std::env::var("LIBREFI_ADMIN_LAN")
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "true" | "1" | "yes" | "on"
+            )
+        })
+        .unwrap_or(true)
+}
+
 pub fn key_bytes() -> [u8; 32] {
     let secret = std::env::var("LIBREFI_KEY").unwrap_or_else(|_| {
         eprintln!("[FATAL] LIBREFI_KEY environment variable is not set. Set it to a strong secret key.");

@@ -25,7 +25,8 @@ function AdminDashboard() {
     const [data, setData] = useState<DashBoardT | null>();
 
     async function getDashboard() {
-        const res = await fetch("/api/admin/dashboard?payload=" + await encrypt(getAdminKey(), JSON.stringify({ "id": 1 })));
+        const encryptedPayload = await encrypt(getAdminKey(), JSON.stringify({ "id": 1 }));
+        const res = await fetch("/api/admin/dashboard?payload=" + encodeURIComponent(encryptedPayload || ""));
         if (res.ok) {
             const json = await res.json();
             setData(json)

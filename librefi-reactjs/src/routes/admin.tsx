@@ -18,17 +18,49 @@ function AdminLogin() {
     const [, setLocation] = useLocation();
 
     async function login(k: string, p: string) {
-        setIsLoading(true)
-        const res = await fetch("/api/admin/dashboard?payload=" + await encrypt(k, p));
-        if (res.ok) {
-            window.localStorage.setItem("adminkey", k);
-            setLocation("/dashboard");
-        } else {
-            toast.error("Invalid admin key", {
-                position: "top-center"
+        setIsLoading(true);
+        try {
+            const encryptedPayload = await encrypt(k, p);
+            if (!encryptedPayload) {
+                toast.error("Could not encrypt the login request", {
+                    position: "top-center",
+                    description: "Check that the browser supports Web Crypto and that this page is loaded securely."
+                });
+                return;
+            }
+
+            const res = await fetch(
+                "/api/admin/dashboard?payload=" + encodeURIComponent(encryptedPayload)
+            );
+
+            if (res.ok) {
+                window.localStorage.setItem("adminkey", k);
+                setLocation("/dashboard");
+                return;
+            }
+
+            if (res.status === 401) {
+                window.localStorage.removeItem("adminkey");
+                toast.error("Invalid admin key", { position: "top-center" });
+            } else if (res.status === 403) {
+                toast.error("Admin access blocked from this network", {
+                    position: "top-center",
+                    description: "The server is still applying its LAN access restriction."
+                });
+            } else {
+                toast.error(`Admin login failed (HTTP ${res.status})`, {
+                    position: "top-center",
+                    description: "Check the LibreFi server logs for the request error."
+                });
+            }
+        } catch (error) {
+            toast.error("Could not reach the LibreFi server", {
+                position: "top-center",
+                description: error instanceof Error ? error.message : "Network or browser error."
             });
+        } finally {
+            setIsLoading(false);
         }
-        setIsLoading(false)
     }
 
     useEffect(() => {

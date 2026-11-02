@@ -3,7 +3,7 @@ use crate::network::server::Request;
 use base64::Engine;
 use serde::Deserialize;
 
-use super::{key_bytes, LAN_SUBNET};
+use super::{key_bytes, lan_admin_enabled, LAN_SUBNET};
 use crate::utils::crypto::decrypt_payload;
 
 #[derive(Deserialize)]
@@ -12,13 +12,9 @@ pub struct AdminBody {
 }
 
 pub fn parse_admin_payload(req: &Request) -> Result<String, (u16, Vec<u8>)> {
-    // Allow LAN admin access through environment configuration.
-    let allow_lan = std::env::var("LIBREFI_ADMIN_LAN")
-        .map(|v| v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
-
-    // Block LAN admin access only when the setting is disabled.
-    if req.ip.starts_with(LAN_SUBNET) && !allow_lan {
+    // LAN administration is enabled by default. Set LIBREFI_ADMIN_LAN=false
+    // to restore the original restriction for requests from the 10.0.x.x LAN.
+    if req.ip.starts_with(LAN_SUBNET) && !lan_admin_enabled() {
         return Err((
             403,
             b"{\"error\":\"Admin access denied from LAN\"}".to_vec(),

@@ -25,7 +25,7 @@ export default function AdminSettings() {
         const key = getAdminKey();
         const payload = await encrypt(key, JSON.stringify({ action: "get" }));
 
-        const resQos = await fetch("/api/admin/qos");
+        const resQos = await fetch(`/api/admin/qos?payload=${encodeURIComponent(payload || "")}`);
         if (resQos.ok) {
             const data = await resQos.json();
             setQos({
@@ -36,13 +36,13 @@ export default function AdminSettings() {
             });
         }
 
-        const resWifi = await fetch(`/api/admin/wifi?payload=${payload}`);
+        const resWifi = await fetch(`/api/admin/wifi?payload=${encodeURIComponent(payload || "")}`);
         if (resWifi.ok) {
             const data = await resWifi.json();
             setWifi(data);
         }
 
-        const resCoinslot = await fetch(`/api/admin/coinslot-key?payload=${payload}`);
+        const resCoinslot = await fetch(`/api/admin/coinslot-key?payload=${encodeURIComponent(payload || "")}`);
         if (resCoinslot.ok) {
             const data = await resCoinslot.json();
             setCoinslot(data);

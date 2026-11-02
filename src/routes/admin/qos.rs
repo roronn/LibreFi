@@ -3,7 +3,7 @@ use crate::utils::db::{CONFIG_TABLE, get_db};
 use redb::ReadableDatabase;
 use serde::{Deserialize, Serialize};
 
-use super::{LAN_SUBNET, auth::parse_admin_payload};
+use super::auth::parse_admin_payload;
 
 #[derive(Serialize, Deserialize, Default)]
 pub struct QosPayload {
@@ -148,9 +148,10 @@ pub fn handle_qos(server: &mut Server) {
     });
 
     server.get("/api/admin/qos", |req, res| {
-        if req.ip.starts_with(LAN_SUBNET) {
-            res.status = 403;
-            res.body = b"{\"error\":\"Admin access denied from LAN\"}".to_vec();
+        // Keep this read endpoint authenticated just like the other admin APIs.
+        if let Err((status, body)) = parse_admin_payload(req) {
+            res.status = status;
+            res.body = body;
             res.content_type = String::from("application/json");
             return;
         }

@@ -1,3 +1,6 @@
+import { gcm } from "@noble/ciphers/aes.js";
+import { randomBytes } from "@noble/ciphers/utils.js";
+
 import { clsx, type ClassValue } from "clsx"
 import { twMerge } from "tailwind-merge"
 
@@ -42,32 +45,28 @@ export function formatSeconds(totalSeconds: number, maxUnits = 2) {
 
 export async function encrypt(keyStr: string, payloadStr: string) {
   try {
-
     JSON.parse(payloadStr);
 
+    // Match the Rust backend: UTF-8 key bytes, zero-padded or truncated to 32 bytes.
     const enc = new TextEncoder();
     const rawKey = enc.encode(keyStr);
     const keyBytes = new Uint8Array(32);
     keyBytes.set(rawKey.slice(0, 32));
 
-    const cryptoKey = await crypto.subtle.importKey(
-      'raw', keyBytes, 'AES-GCM', false, ['encrypt']
-    );
+    // Use a vetted pure-JavaScript AES-GCM implementation. Unlike crypto.subtle,
+    // this works when LibreFi is opened over plain HTTP on a private LAN IP.
+    // crypto.getRandomValues (used by randomBytes) remains available in this context.
+    const nonce = randomBytes(12);
+    const ciphertext = gcm(keyBytes, nonce).encrypt(enc.encode(payloadStr));
 
-    const nonce = crypto.getRandomValues(new Uint8Array(12));
-
-    const ciphertext = await crypto.subtle.encrypt(
-      { name: 'AES-GCM', iv: nonce },
-      cryptoKey,
-      enc.encode(payloadStr)
-    );
-
+    // Backend format: Base64([12-byte nonce] + [AES-GCM ciphertext + tag]).
     const combined = new Uint8Array(12 + ciphertext.byteLength);
     combined.set(nonce, 0);
-    combined.set(new Uint8Array(ciphertext), 12);
+    combined.set(ciphertext, 12);
 
     return btoa(String.fromCharCode(...combined));
   } catch (e) {
+    console.error("Admin payload encryption failed:", e);
     return null;
   }
 }

@@ -5,7 +5,7 @@ use redb::ReadableDatabase;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub fn init(server: &mut Server) {
-    server.get("/init", |req, res| {
+    server.get("/api/init", |req, res| {
         let Some(mac) = get_mac_from_ip(&req.ip) else {
             res.status = 403;
             res.body = b"{\"error\":\"Device not recognized\"}".to_vec();

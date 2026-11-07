@@ -1,7 +1,23 @@
 @import "tailwindcss";
 @import "tw-animate-css";
 @import "shadcn/tailwind.css";
-@import '@fontsource-variable/plus-jakarta-sans/wght.css';
+@font-face {
+  font-family: 'Plus Jakarta Sans Variable';
+  font-style: normal;
+  font-display: swap;
+  font-weight: 400 800;
+  src: url('./assets/fonts/plus-jakarta-sans-latin.woff2') format('woff2-variations');
+  unicode-range: U+0000-00FF;
+}
+
+@font-face {
+  font-family: 'Plus Jakarta Sans Variable';
+  font-style: normal;
+  font-display: swap;
+  font-weight: 400 800;
+  src: url('./assets/fonts/plus-jakarta-sans-peso.woff2') format('woff2-variations');
+  unicode-range: U+20B1;
+}
 
 @custom-variant dark (&:is(.dark *));
 

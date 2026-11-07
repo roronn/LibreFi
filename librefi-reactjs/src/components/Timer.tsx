@@ -1,7 +1,4 @@
-"use client";
-
-import { useEffect, useState } from "react";
-import NumberFlow, { NumberFlowGroup } from "@number-flow/react";
+import { memo, useEffect, useState } from "react";
 import type { UserType } from "../types/user";
 
 type NumberTickerProps = {
@@ -12,6 +9,7 @@ type NumberTickerProps = {
     showHours?: boolean;
 };
 
+// Plain text avoids animated digit components and their extra layout work.
 function NumberTicker({
     seconds,
     className,
@@ -19,117 +17,73 @@ function NumberTicker({
     showDays = true,
     showHours = true,
 }: NumberTickerProps) {
-    const SECONDS_IN_MINUTE = 60;
-    const SECONDS_IN_HOUR = 3600;
-    const SECONDS_IN_DAY = 86400;
-    const SECONDS_IN_MONTH = 2592000;
+    const safeSeconds = Math.max(0, Math.floor(seconds));
+    const mo = Math.floor(safeSeconds / 2592000);
+    const d = Math.floor((safeSeconds % 2592000) / 86400);
+    const h = Math.floor((safeSeconds % 86400) / 3600);
+    const m = Math.floor((safeSeconds % 3600) / 60);
+    const s = safeSeconds % 60;
 
-    const mo = Math.floor(seconds / SECONDS_IN_MONTH);
-    const d = Math.floor((seconds % SECONDS_IN_MONTH) / SECONDS_IN_DAY);
-    const h = Math.floor((seconds % SECONDS_IN_DAY) / SECONDS_IN_HOUR);
-    const m = Math.floor((seconds % SECONDS_IN_HOUR) / SECONDS_IN_MINUTE);
-    const s = seconds % SECONDS_IN_MINUTE;
-
-    // Cascading logic: Only show a segment if it's > 0 OR if a larger unit exists
     const displayMonths = showMonths && mo > 0;
     const displayDays = showDays && (displayMonths || d > 0);
     const displayHours = showHours && (displayDays || h > 0);
+    const segmentsCount = 2 + Number(displayHours) + Number(displayDays) + Number(displayMonths);
+    const sizeClass = segmentsCount === 5
+        ? "text-[11cqw]"
+        : segmentsCount === 4
+            ? "text-[14cqw]"
+            : segmentsCount === 3
+                ? "text-[19cqw]"
+                : "text-[29cqw]";
 
-    const segmentsCount = 2 + (displayHours ? 1 : 0) + (displayDays ? 1 : 0) + (displayMonths ? 1 : 0);
-
-    let adaptiveTextSize = "text-[29cqw]";
-    if (segmentsCount === 3) adaptiveTextSize = "text-[19cqw]";
-    if (segmentsCount === 4) adaptiveTextSize = "text-[14cqw]";
-    if (segmentsCount === 5) adaptiveTextSize = "text-[11cqw]";
+    const parts: { value: number; label: string; tone: string }[] = [];
+    if (displayMonths) parts.push({ value: mo, label: "MONTH", tone: "text-primary" });
+    if (displayDays) parts.push({ value: d, label: "DAY", tone: displayMonths ? "text-foreground/90" : "text-primary/95" });
+    if (displayHours) parts.push({ value: h, label: "HOUR", tone: displayDays ? "text-foreground/90" : "text-primary/95" });
+    parts.push({ value: m, label: "MIN", tone: displayHours ? "text-foreground/90" : "text-primary/95" });
+    parts.push({ value: s, label: "SEC", tone: "text-foreground/70" });
 
     return (
-        <div className={`${className} ${adaptiveTextSize} flex items-center justify-center gap-[1.5cqw] w-full`}>
-            <NumberFlowGroup>
-                {displayMonths && (
-                    <>
-                        <div>
-                            <NumberFlow className="text-primary" value={mo} format={{ minimumIntegerDigits: 2 }} />
-                            <div className="mt-[-2cqw] text-[3cqw] text-foreground/50 text-center pt-[1cqw] tracking-normal w-full">
-                                <span>MONTH</span>
-                            </div>
-                        </div>
-                        <div className="text-foreground/10 mt-[-6cqw]">:</div>
-                    </>
-                )}
-                {displayDays && (
-                    <>
-                        <div>
-                            <NumberFlow className={displayMonths ? "text-foreground/90" : "text-primary/95"} value={d} format={{ minimumIntegerDigits: 2 }} />
-                            <div className="mt-[-2cqw] text-[3cqw] text-foreground/50 text-center pt-[1cqw] tracking-normal w-full">
-                                <span>DAY</span>
-                            </div>
-                        </div>
-                        <div className="text-foreground/10 mt-[-6cqw]">:</div>
-                    </>
-                )}
-                {displayHours && (
-                    <>
-                        <div>
-                            <NumberFlow className={displayDays ? "text-foreground/90" : "text-primary/95"} value={h} format={{ minimumIntegerDigits: 2 }} />
-                            <div className="mt-[-2cqw] text-[3cqw] text-foreground/50 text-center pt-[1cqw] tracking-normal w-full">
-                                <span>HOUR</span>
-                            </div>
-                        </div>
-                        <div className="text-foreground/10 mt-[-6cqw]">:</div>
-                    </>
-                )}
-                {/* Minutes and seconds always display as the minimum format */}
-                <div>
-                    <NumberFlow className={displayHours ? "text-foreground/90" : "text-primary/95"} value={m} format={{ minimumIntegerDigits: 2 }} />
-                    <div className="mt-[-2cqw] text-[3cqw] text-foreground/50 text-center pt-[1cqw] tracking-normal w-full">
-                        <span>MIN</span>
+        <div className={`${className ?? ""} ${sizeClass} flex items-center justify-center gap-[1.5cqw] w-full`}>
+            {parts.map((part, index) => (
+                <div key={part.label} className="flex items-center gap-[1.5cqw]">
+                    {index > 0 && <span aria-hidden="true" className="text-foreground/10">:</span>}
+                    <div className="min-w-0 text-center">
+                        <span className={`${part.tone} tabular-nums`}>{String(part.value).padStart(2, "0")}</span>
+                        <div className="mt-[-2cqw] text-[3cqw] text-foreground/50 text-center pt-[1cqw] tracking-normal w-full">{part.label}</div>
                     </div>
                 </div>
-                <div className="text-foreground/10 mt-[-6cqw]">:</div>
-                <div>
-                    <NumberFlow className="text-foreground/70" value={s} format={{ minimumIntegerDigits: 2 }} />
-                    <div className="mt-[-2cqw] text-[3cqw] text-foreground/50 text-center pt-[1cqw] tracking-normal w-full">
-                        <span>SEC</span>
-                    </div>
-                </div>
-            </NumberFlowGroup>
+            ))}
         </div>
     );
 }
 
-const Timer = ({ user }: { user: UserType | undefined }) => {
+function Timer({ user }: { user: UserType | undefined }) {
     const [sec, setSec] = useState(0);
 
+    // Recalculate only when the server-provided session baseline changes.
     useEffect(() => {
-        (() => {
-            if (user) {
-                if (user.paused) {
-                    setSec(Math.max(0, user.expires_on - user.paused_on))
-                    return;
-                }
-                setSec(Math.max(0, user.expires_on - user.now))
-            }
-        })()
-    }, [user]);
+        if (!user) {
+            setSec(0);
+            return;
+        }
+        setSec(Math.max(0, user.expires_on - (user.paused ? user.paused_on : user.now)));
+    }, [user?.expires_on, user?.now, user?.paused, user?.paused_on]);
 
+    // The one-second tick updates only this component's local state.
     useEffect(() => {
         if (!user || user.paused) return;
-
-        const timer = setInterval(() => {
-            setSec((prev) => (prev > 0 ? prev - 1 : 0));
+        const intervalId = window.setInterval(() => {
+            setSec(previous => previous > 0 ? previous - 1 : 0);
         }, 1000);
-
-        return () => clearInterval(timer);
-    }, [user]);
+        return () => window.clearInterval(intervalId);
+    }, [user?.paused, user?.expires_on]);
 
     return (
         <div className="@container w-full flex justify-center">
-            <NumberTicker
-                seconds={sec}
-                className="text-foreground font-semibold tabular-nums tracking-tighter"
-            />
+            <NumberTicker seconds={sec} className="text-foreground font-semibold tabular-nums tracking-tighter" />
         </div>
     );
-};
+}
 
-export default Timer;
+export default memo(Timer);

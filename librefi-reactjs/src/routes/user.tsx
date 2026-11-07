@@ -1,9 +1,6 @@
-import Coin from "#components/Coin";
-import More from "#components/More";
 import Timer from "#components/Timer";
-import { Button } from "#components/ui/button"
-import Voucher from "#components/Voucher";
-import { CoinsIcon, EllipsisVertical, Loader2Icon, PauseIcon, PlayIcon, Ticket } from "lucide-react"
+import UserControls from "#components/UserControls";
+import { Loader2Icon } from "lucide-react"
 import { useCallback, useEffect, useState } from "react"
 import type { UserType } from ".././types/user";
 import { toast } from "#components/ui/toast";
@@ -75,7 +72,7 @@ function User() {
         })()
     }, [user])
 
-    async function handlePlayPause() {
+    const handlePlayPause = useCallback(async () => {
         const playPauseRequest = async () => {
             const res = await fetch("/api/play_pause", {
                 method: "POST"
@@ -130,62 +127,37 @@ function User() {
             },
             { position: "top-center" }
         );
-    }
+    }, [user]);
 
-    function updateUser(expires_on: number, now: number) {
-        if (user) setUser({ ...user, expires_on: expires_on, now: now })
-    }
+    const updateUser = useCallback((expires_on: number, now: number) => {
+        if (user) setUser({ ...user, expires_on, now });
+    }, [user]);
 
     return (
         <>
             <div className="grid place-items-center h-screen [@supports(height:100dvh)]:h-dvh w-screen relative">
                 <div className="absolute bottom-0 w-full text-center text-foreground/80">
-                    <p className="p-2 text-xs">©{new Date().getFullYear()} LibreFi by <a className="text-foreground underline decoration-primary underline-offset-2" href="https://github.com/nel003/LibreFi">@nel003</a></p>
+                    <p className="p-1 text-xs">©{new Date().getFullYear()} LibreFi by <a className="text-foreground underline decoration-primary underline-offset-1">@nel003</a></p>
                 </div>
 
                 <div className="max-w-lg w-full p-6">
+                    <div className="text-center pb-5 font-extrabold tracking-tight text-3xl"><span className="text-amber-400 text-4xl font-black tracking-[-0.28em] mr-[5px]">//</span>NetSn<span className="text-4xl inline-block">ꝍ</span>p PisoWifi</div>
                     <h1 className="text-center pb-8 text-sm flex items-center justify-center ">{status} {status === "Testing" ? <span className="pl-1 "> <Loader2Icon size={16} className="animate-spin " /></span> : <></>} </h1>
 
                     <div className="bg-amber-50/30 dark:bg-amber-300/5">
-                        <div className="w-full flex justify-center backdrop-blur-3xl  py-4">
+                        <div className="w-full flex justify-center py-4">
                             <Timer
                                 user={user}
                             />
                         </div>
                     </div>
 
-                    <div className="w-full flex gap-4 pt-16 justify-center">
-                        <div className="flex flex-col">
-                            <Button onClick={handlePlayPause} variant="outline" size="icon-lg" className="hover:scale-125 hover:bg-primary/5 hover:text-primary/90 hover:-rotate-6">
-                                {user?.paused ? <PlayIcon className="text-green-500" /> : <PauseIcon className="text-yellow-400" />}
-                            </Button>
-                            <span className="text-[0.7rem] text-center mt-1 text-foreground/60">{user?.paused ? "PLAY" : "PAUSE"}</span>
-                        </div>
-                        <div className="flex flex-col">
-                            <Coin onClose={init}>
-                                <Button variant="outline" size="icon-lg" className="hover:scale-125 hover:bg-primary/5 hover:text-primary/90 hover:-rotate-6">
-                                    <CoinsIcon />
-                                </Button>
-                            </Coin>
-                            <span className="text-[0.7rem] text-center mt-1 text-foreground/60">COIN</span>
-                        </div>
-                        <div className="flex flex-col">
-                            <Voucher updateUser={updateUser}>
-                                <Button variant="outline" size="icon-lg" className="hover:scale-125 hover:bg-primary/5 hover:text-primary/90 hover:-rotate-6">
-                                    <Ticket />
-                                </Button>
-                            </Voucher>
-                            <span className="text-[0.7rem] text-center mt-1 text-foreground/60">VOUC</span>
-                        </div>
-                        <div className="flex flex-col">
-                            <More user={user}>
-                                <Button variant="outline" size="icon-lg" className="hover:scale-125 hover:bg-primary/5 hover:text-primary/90 hover:-rotate-6">
-                                    <EllipsisVertical />
-                                </Button>
-                            </More>
-                            <span className="text-[0.7rem] text-center mt-1 text-foreground/60">MORE</span>
-                        </div>
-                    </div>
+                    <UserControls
+                        user={user}
+                        onRefresh={init}
+                        onPlayPause={handlePlayPause}
+                        onUpdateUser={updateUser}
+                    />
 
                 </div>
             </div>

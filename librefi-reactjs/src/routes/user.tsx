@@ -1,13 +1,20 @@
 import Coin from "#components/Coin";
-import More from "#components/More";
+import More, { Price } from "#components/More";
 import Timer from "#components/Timer";
-import { Button } from "#components/ui/button"
+import { Button } from "#components/ui/button";
 import Voucher from "#components/Voucher";
-import { CoinsIcon, EllipsisVertical, Loader2Icon, PauseIcon, PlayIcon, Ticket } from "lucide-react"
-import { useCallback, useEffect, useState } from "react"
+import {
+    CoinsIcon,
+    EllipsisVertical,
+    PhilippinePeso,
+    Loader2Icon,
+    PauseIcon,
+    PlayIcon,
+    Ticket
+} from "lucide-react";
+import { useCallback, useEffect, useState } from "react";
 import type { UserType } from ".././types/user";
 import { toast } from "#components/ui/toast";
-
 
 function User() {
     const [user, setUser] = useState<UserType>();
@@ -20,23 +27,27 @@ function User() {
 
         if (res.status === 200) {
             const json = await res.json();
-            setUser(json)
+            setUser(json);
         }
-
     }, []);
 
     const testConnection = useCallback(async () => {
         try {
             setStatus("Testing");
-            const res = await fetch(`https://dns.google/resolve?name=google.com&_=${Date.now()}`, {
-                method: "GET",
-                signal: AbortSignal.timeout(2000)
-            });
+
+            const res = await fetch(
+                `https://dns.google/resolve?name=google.com&_=${Date.now()}`,
+                {
+                    method: "GET",
+                    signal: AbortSignal.timeout(2000)
+                }
+            );
 
             if (res.status === 200) {
                 setStatus("Connected");
 
-                const hasInternet = user && (user.expires_on > user.now) && !user.paused;
+                const hasInternet =
+                    user && user.expires_on > user.now && !user.paused;
 
                 if (hasInternet && window.location.pathname !== "/") {
                     const url = new URL(window.location.href);
@@ -55,25 +66,22 @@ function User() {
         } catch (error) {
             setStatus("Disconnected");
         }
-
     }, []);
 
     useEffect(() => {
-        (() => {
-            init();
-        })()
-    }, [init])
+        init();
+    }, [init]);
 
     useEffect(() => {
         (async () => {
-            if (user && user?.paused) {
-                setStatus("Paused")
+            if (user && user.paused) {
+                setStatus("Paused");
                 return;
             }
 
             if (user) await testConnection();
-        })()
-    }, [user])
+        })();
+    }, [user]);
 
     async function handlePlayPause() {
         const playPauseRequest = async () => {
@@ -86,7 +94,8 @@ function User() {
 
                 try {
                     const errorData = await res.json();
-                    serverErrorMessage = errorData.error || serverErrorMessage;
+                    serverErrorMessage =
+                        errorData.error || serverErrorMessage;
                 } catch {
                     const textError = await res.text();
                     if (textError) serverErrorMessage = textError;
@@ -106,6 +115,7 @@ function User() {
                     paused: json.paused,
                     paused_on: json.paused_on
                 });
+
                 return json;
             } else {
                 throw new Error("User session not found.");
@@ -125,7 +135,10 @@ function User() {
                 },
                 error: (err) => ({
                     title: "Update failed",
-                    description: err instanceof Error ? err.message : "Something went wrong."
+                    description:
+                        err instanceof Error
+                            ? err.message
+                            : "Something went wrong."
                 })
             },
             { position: "top-center" }
@@ -133,64 +146,124 @@ function User() {
     }
 
     function updateUser(expires_on: number, now: number) {
-        if (user) setUser({ ...user, expires_on: expires_on, now: now })
+        if (user) {
+            setUser({ ...user, expires_on, now });
+        }
     }
 
     return (
-        <>
-            <div className="grid place-items-center h-screen [@supports(height:100dvh)]:h-dvh w-screen relative">
-                <div className="absolute bottom-0 w-full text-center text-foreground/80">
-                    <p className="p-2 text-xs">©{new Date().getFullYear()} LibreFi by <a className="text-foreground underline decoration-primary underline-offset-2" href="https://github.com/nel003/LibreFi">@nel003</a></p>
-                </div>
+        <div className="grid place-items-center min-h-screen [@supports(height:100dvh)]:min-h-dvh w-screen">
+            <main className="max-w-lg w-full px-6 py-8">
+            <header className="text-center mb-8">
+                <h1 className="text-2xl font-extrabold tracking-tight">
+                    <span className="text-3xl text-yellow-400 font-black tracking-[-0.22em]">//</span><span>NetSn<span className="text-3xl font-extrabold tracking-tight">ꝍ</span>p</span><span className="ml-1">PisoWifi</span>
+                </h1>
 
-                <div className="max-w-lg w-full p-6">
-                    <h1 className="text-center pb-8 text-sm flex items-center justify-center ">{status} {status === "Testing" ? <span className="pl-1 "> <Loader2Icon size={16} className="animate-spin " /></span> : <></>} </h1>
-
-                    <div className="bg-amber-50/30 dark:bg-amber-300/5">
-                        <div className="w-full flex justify-center backdrop-blur-3xl  py-4">
-                            <Timer
-                                user={user}
+                    <div className="mt-3 flex items-center justify-center gap-2 text-sm text-foreground/70">
+                        {status === "Testing" ? (
+                            <Loader2Icon size={14} className="animate-spin" />
+                        ) : (
+                            <span
+                                className={`h-2 w-2 rounded-full ${
+                                    status === "Connected"
+                                        ? "bg-green-500"
+                                        : status === "Paused"
+                                          ? "bg-yellow-400"
+                                          : "bg-red-500"
+                                }`}
                             />
-                        </div>
+                        )}
+                        <span>{status}</span>
                     </div>
+                </header>
 
-                    <div className="w-full flex gap-4 pt-16 justify-center">
-                        <div className="flex flex-col">
-                            <Button onClick={handlePlayPause} variant="outline" size="icon-lg" className="hover:scale-125 hover:bg-primary/5 hover:text-primary/90 hover:-rotate-6">
-                                {user?.paused ? <PlayIcon className="text-green-500" /> : <PauseIcon className="text-yellow-400" />}
-                            </Button>
-                            <span className="text-[0.7rem] text-center mt-1 text-foreground/60">{user?.paused ? "PLAY" : "PAUSE"}</span>
-                        </div>
-                        <div className="flex flex-col">
-                            <Coin onClose={init}>
-                                <Button variant="outline" size="icon-lg" className="hover:scale-125 hover:bg-primary/5 hover:text-primary/90 hover:-rotate-6">
-                                    <CoinsIcon />
-                                </Button>
-                            </Coin>
-                            <span className="text-[0.7rem] text-center mt-1 text-foreground/60">COIN</span>
-                        </div>
-                        <div className="flex flex-col">
-                            <Voucher updateUser={updateUser}>
-                                <Button variant="outline" size="icon-lg" className="hover:scale-125 hover:bg-primary/5 hover:text-primary/90 hover:-rotate-6">
-                                    <Ticket />
-                                </Button>
-                            </Voucher>
-                            <span className="text-[0.7rem] text-center mt-1 text-foreground/60">VOUC</span>
-                        </div>
-                        <div className="flex flex-col">
-                            <More user={user}>
-                                <Button variant="outline" size="icon-lg" className="hover:scale-125 hover:bg-primary/5 hover:text-primary/90 hover:-rotate-6">
-                                    <EllipsisVertical />
-                                </Button>
-                            </More>
-                            <span className="text-[0.7rem] text-center mt-1 text-foreground/60">MORE</span>
-                        </div>
+                <section className="bg-amber-50/30 dark:bg-amber-300/5 rounded-2xl">
+                    <div className="w-full flex justify-center backdrop-blur-3xl py-5">
+                        <Timer user={user} />
                     </div>
+                </section>
 
+                <div className="mt-6">
+                    <Coin onClose={init}>
+                        <Button
+                            className="w-full h-14 rounded-xl text-base font-bold tracking-wide shadow-sm"
+                        >
+                            <CoinsIcon className="mr-2" size={21} />
+                            INSERT COIN
+                        </Button>
+                    </Coin>
                 </div>
-            </div>
-        </>
-    )
+
+                <nav className="w-full flex items-start justify-center gap-8 mt-8">
+                    <div className="flex flex-col items-center">
+                        <Button
+                            onClick={handlePlayPause}
+                            variant="outline"
+                            size="icon-lg"
+                            className="rounded-xl"
+                        >
+                            {user?.paused ? (
+                                <PlayIcon className="text-green-500" />
+                            ) : (
+                                <PauseIcon className="text-yellow-400" />
+                            )}
+                        </Button>
+                        <span className="text-[0.7rem] text-center mt-2 text-foreground/60">
+                            {user?.paused ? "PLAY" : "PAUSE"}
+                        </span>
+                    </div>
+
+                    <div className="flex flex-col items-center">
+                        <Voucher updateUser={updateUser}>
+                            <Button
+                                variant="outline"
+                                size="icon-lg"
+                                className="rounded-xl"
+                            >
+                                <Ticket />
+                            </Button>
+                        </Voucher>
+                        <span className="text-[0.7rem] text-center mt-2 text-foreground/60">
+                            VOUCHER
+                        </span>
+                    </div>
+
+                    <div className="flex flex-col items-center">
+                        <Price>
+                            <Button
+                                variant="outline"
+                                size="icon-lg"
+                                className="rounded-xl"
+                            >
+                                <PhilippinePeso />
+                            </Button>
+                        </Price>
+                        <span className="text-[0.7rem] text-center mt-2 text-foreground/60">
+                            PRICE
+                        </span>
+                    </div>
+
+                    <div className="flex flex-col items-center">
+                        <More user={user}>
+                            <Button
+                                variant="outline"
+                                size="icon-lg"
+                                className="rounded-xl"
+                            >
+                                <EllipsisVertical />
+                            </Button>
+                        </More>
+                        <span className="text-[0.7rem] text-center mt-2 text-foreground/60">
+                            MORE
+                        </span>
+                    </div>
+                </nav>
+                <footer className="text-center mt-8 text-xs text-foreground/50">
+                    ©2026 LibreFi by @nel003
+                </footer>
+            </main>
+        </div>
+    );
 }
 
 export default User;

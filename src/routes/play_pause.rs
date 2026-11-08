@@ -1,3 +1,4 @@
+
 use crate::network::server::Server;
 use crate::utils::db::{USERS_TABLE, User, get_db};
 use crate::utils::get_mac_from_ip::get_mac_from_ip;
@@ -19,7 +20,6 @@ pub fn play_pause(server: &mut Server) {
             .unwrap_or_default()
             .as_secs() as u32;
 
-        // Read current user
         let read_txn = db.begin_read().unwrap();
         let table = read_txn.open_table(USERS_TABLE).unwrap();
 
@@ -45,7 +45,6 @@ pub fn play_pause(server: &mut Server) {
         drop(read_txn);
 
         let action: &str;
-        const MAX_PAUSES_PER_DAY: u8 = 3;
 
         if user.paused {
             let remaining = user.expires_on.saturating_sub(user.paused_on);
@@ -54,34 +53,11 @@ pub fn play_pause(server: &mut Server) {
             user.paused_on = 0;
             action = "play";
         } else {
-            let today = now / 86400;
-
-            if user.pause_day != today {
-                user.pause_attempts = 0;
-                user.pause_day = today;
-            }
-
-            if user.pause_attempts >= MAX_PAUSES_PER_DAY {
-                res.status = 429;
-                res.body = format!(
-                    "{{\"error\":\"Daily pause limit reached ({}/{})\",\"pause_attempts\":{},\"resets_in\":{}}}",
-                    user.pause_attempts,
-                    MAX_PAUSES_PER_DAY,
-                    user.pause_attempts,
-                    86400 - (now % 86400),  // seconds until midnight UTC
-                )
-                .into_bytes();
-                res.content_type = String::from("application/json");
-                return;
-            }
-
             user.paused_on = now;
             user.paused = true;
-            user.pause_attempts += 1;
             action = "pause";
         }
 
-        // Write updated user
         let write_txn = db.begin_write().unwrap();
         {
             let mut wtable = write_txn.open_table(USERS_TABLE).unwrap();
@@ -95,14 +71,24 @@ pub fn play_pause(server: &mut Server) {
             action, mac, user.paused, user.expires_on, user.pause_attempts
         );
 
-        if user.paused {
-            let cmd = format!("nft delete element inet librefi allowed_macs {{ {} }}", mac);
-            let _ = crate::utils::setup_captive_portal::run_sh_cmd(&cmd, true);
-        } else {
-            let diff = user.expires_on.saturating_sub(now);
-            if diff > 0 {
-                let cmd = format!("nft add element inet librefi allowed_macs {{ {} timeout {}s }}", mac, diff);
+        // OpenWrt firewall commands are only needed on the actual device.
+        #[cfg(not(windows))]
+        {
+            if user.paused {
+                let cmd = format!(
+                    "nft delete element inet librefi allowed_macs {{ {} }}",
+                    mac
+                );
                 let _ = crate::utils::setup_captive_portal::run_sh_cmd(&cmd, true);
+            } else {
+                let diff = user.expires_on.saturating_sub(now);
+                if diff > 0 {
+                    let cmd = format!(
+                        "nft add element inet librefi allowed_macs {{ {} timeout {}s }}",
+                        mac, diff
+                    );
+                    let _ = crate::utils::setup_captive_portal::run_sh_cmd(&cmd, true);
+                }
             }
         }
 

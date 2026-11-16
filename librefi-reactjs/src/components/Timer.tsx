@@ -104,10 +104,10 @@ const Timer = ({ user }: { user: UserType | undefined }) => {
         (() => {
             if (user) {
                 if (user.paused) {
-                    setSec(Math.max(0, user.expires_on - user.paused_on))
+                    setSec(Math.max(0, user.remaining_seconds))
                     return;
                 }
-                setSec(Math.max(0, user.expires_on - user.now))
+                setSec(Math.max(0, user.remaining_seconds))
             }
         })()
     }, [user]);

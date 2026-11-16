@@ -8,7 +8,7 @@ use crate::utils::crypto::decrypt_payload;
 use crate::utils::get_mac_from_ip::get_mac_from_ip;
 
 use super::coinslot::run_coinslot;
-use super::state::{EncryptedPayload, WsMessage, get_subnet};
+use super::state::{EncryptedPayload, WsMessage, get_subnet, new_owner_id};
 use super::user::{handle_user_ack, run_user};
 
 pub fn ws_handler(ws: WebSocket<Box<dyn ReadWrite + Send>>, ip: String) {
@@ -44,7 +44,11 @@ pub fn ws_handler(ws: WebSocket<Box<dyn ReadWrite + Send>>, ip: String) {
                         crate::debug_println!("[WS:{}] Decrypted with coinslot_key: {}", ip, json_str);
                         if let Ok(msg) = serde_json::from_str::<WsMessage>(&json_str) {
                             if msg.msg_type == "COINSLOT" {
-                                crate::debug_println!("[WS:{}] Authenticated as COINSLOT on subnet {}", ip, subnet);
+                                crate::debug_println!(
+                                    "[WS:{}] Authenticated as COINSLOT on subnet {}",
+                                    ip,
+                                    subnet
+                                );
                                 let _ = ws.send(Message::Text(
                                     "{\"type\":\"status\",\"value\":\"ok\"}".to_string().into(),
                                 ));
@@ -63,29 +67,54 @@ pub fn ws_handler(ws: WebSocket<Box<dyn ReadWrite + Send>>, ip: String) {
                             crate::debug_println!("[WS:{}] Decrypted with admin key: {}", ip, json_str);
                             if let Ok(msg) = serde_json::from_str::<WsMessage>(&json_str) {
                                 if msg.msg_type == "COINSLOT" {
-                                    crate::debug_println!("[WS:{}] WARNING: Coinslot attempted to authenticate using the master admin key. Rejected.", ip);
+                                    crate::debug_println!(
+                                        "[WS:{}] WARNING: Coinslot attempted to authenticate using the master admin key. Rejected.",
+                                        ip
+                                    );
                                     return;
                                 }
                             }
                         }
-                        Err(e) => crate::debug_println!("[WS:{}] Decryption failed: {:?} — treating as user.", ip, e),
+                        Err(e) => crate::debug_println!(
+                            "[WS:{}] Decryption failed: {:?} — treating as user.",
+                            ip,
+                            e
+                        ),
                     }
                 }
             }
             Err(e) => crate::debug_println!(
                 "[WS:{}] Base64 decode failed: {} — treating as user.",
-                ip, e
+                ip,
+                e
             ),
         }
     }
 
     let mut user_ws = ws;
 
+    // Each browser WebSocket connection gets its own reservation identity.
+    let owner_id = new_owner_id();
+
     if let Ok(ws_msg) = serde_json::from_str::<WsMessage>(&txt) {
         if ws_msg.msg_type == "ACK" {
-            handle_user_ack(&mut user_ws, &ip, &subnet);
+            let browser_token = ws_msg.value.as_ref()
+                .and_then(|value| value.as_str())
+                .filter(|token| {
+                    token.len() == 64
+                        && token.bytes().all(|b| b.is_ascii_hexdigit())
+                })
+                .map(str::to_string);
+
+            handle_user_ack(
+                &mut user_ws,
+                &ip,
+                &subnet,
+                &owner_id,
+                browser_token,
+            );
         }
     }
 
-    run_user(user_ws, subnet, ip);
+    run_user(user_ws, subnet, ip, owner_id);
 }

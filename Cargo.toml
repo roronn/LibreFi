@@ -12,6 +12,8 @@ aes-gcm = { version = "0.10", features = ["aes"] }
 base64 = "0.22"
 tungstenite = "0.30.0"
 rust-embed = { version = "8.12.0" }
+rand = "0.8"
+sha2 = "0.11"
 
 [profile.release]
 strip = true
@@ -22,4 +24,3 @@ panic = "unwind"
 
 [dev-dependencies]
 ureq = { version = "2.9.1", features = ["json"] }
-rand = "0.8"

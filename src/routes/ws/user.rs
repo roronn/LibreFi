@@ -4,17 +4,24 @@ use tiny_http::ReadWrite;
 use tungstenite::protocol::{Message, WebSocket};
 
 use super::state::{
-    ACTIVE_USER, RelayRequest, RelayResult, USER_EVENTS, WsMessage, get_coinslot_senders,
+    RelayRequest, RelayResult, USER_EVENTS, WsMessage,
+    get_active_user, get_coinslot_senders,
+    refresh_active_user, release_active_user, reserve_active_user,
 };
 
-pub fn run_user(mut ws: WebSocket<Box<dyn ReadWrite + Send>>, subnet: String, ip: String) {
+pub fn run_user(
+    mut ws: WebSocket<Box<dyn ReadWrite + Send>>,
+    subnet: String,
+    ip: String,
+    owner_id: String,
+) {
     crate::debug_println!("[USER:{}] Browser client connected.", ip);
 
     loop {
         let msg = match ws.read() {
             Ok(m) => m,
             Err(_) => {
-                crate::debug_println!("[USER:{}] Disconnected.", ip);
+                crate::debug_println!("[USER:{}] Browser disconnected.", ip);
                 break;
             }
         };
@@ -33,189 +40,170 @@ pub fn run_user(mut ws: WebSocket<Box<dyn ReadWrite + Send>>, subnet: String, ip
 
         if let Ok(ws_msg) = serde_json::from_str::<WsMessage>(txt) {
             if ws_msg.msg_type == "ping" {
-                let mac = crate::utils::get_mac_from_ip::get_mac_from_ip(&ip).unwrap_or_default();
-                let mut events_map = USER_EVENTS.lock().unwrap();
-                if let Some(events) = events_map.get_mut(&mac) {
-                    for ev in events.drain(..) {
-                        if let Ok(json) = serde_json::to_string(&ev) {
-                            let _ = ws.send(Message::Text(json.into()));
+                if refresh_active_user(&subnet, &owner_id) {
+                    if let Some(active) = get_active_user(&subnet) {
+                        if active.owner_id == owner_id {
+                            let mut events_map = USER_EVENTS.lock().unwrap();
+
+                            if let Some(events) = events_map.get_mut(&owner_id) {
+                                for ev in events.drain(..) {
+                                    if let Ok(json) = serde_json::to_string(&ev) {
+                                        let _ = ws.send(Message::Text(json.into()));
+                                    }
+                                }
+                            }
                         }
                     }
-                }
-            } else if ws_msg.msg_type == "DONE" {
-                let sender = get_coinslot_senders().lock().unwrap().get(&subnet).cloned();
-                if let Some(coinslot_tx) = sender {
-                    let relay_req = RelayRequest { reply_tx: None, command: "close".to_string() };
-                    let _ = coinslot_tx.send(relay_req);
-                }
-                
-                let mac = crate::utils::get_mac_from_ip::get_mac_from_ip(&ip).unwrap_or_default();
-                let mut active_map = ACTIVE_USER.lock().unwrap();
-                if active_map.get(&subnet) == Some(&mac) {
-                    active_map.remove(&subnet);
                 }
             } else if ws_msg.msg_type == "ACK" {
-                let mac = crate::utils::get_mac_from_ip::get_mac_from_ip(&ip).unwrap_or_default();
-                {
-                    let active_map = ACTIVE_USER.lock().unwrap();
-                    if let Some(active_mac) = active_map.get(&subnet) {
-                        if active_mac != &mac {
-                            crate::debug_println!("[USER:{}] Coinslot is already in use by MAC {}", ip, active_mac);
-                            let _ = ws.send(Message::Text(
-                                "{\"error\":\"Coinslot is currently in use by another user\"}".to_string().into(),
-                            ));
-                            continue;
-                        }
+                let browser_token = ws_msg.value.as_ref()
+                    .and_then(|value| value.as_str())
+                    .filter(|token| {
+                        token.len() == 64
+                            && token.bytes().all(|b| b.is_ascii_hexdigit())
+                    })
+                    .map(str::to_string);
+
+                handle_user_ack(
+                    &mut ws,
+                    &ip,
+                    &subnet,
+                    &owner_id,
+                    browser_token,
+                );
+            } else if ws_msg.msg_type == "DONE" {
+                if release_active_user(&subnet, &owner_id) {
+                    crate::debug_println!(
+                        "[USER:{}] Owner completed coin-slot session.",
+                        ip
+                    );
+
+                    let sender = get_coinslot_senders()
+                        .lock()
+                        .unwrap()
+                        .get(&subnet)
+                        .cloned();
+
+                    if let Some(coinslot_tx) = sender {
+                        let _ = coinslot_tx.send(RelayRequest {
+                            reply_tx: None,
+                            command: "close".to_string(),
+                        });
                     }
                 }
-                
-                let sender = get_coinslot_senders().lock().unwrap().get(&subnet).cloned();
-
-                match sender {
-                    None => {
-                        crate::debug_println!("[USER:{}] No coinslot registered on subnet {}", ip, subnet);
-                        let _ = ws.send(Message::Text(
-                            "{\"error\":\"Coinslot is not available\"}"
-                                .to_string()
-                                .into(),
-                        ));
-                    }
-                    Some(coinslot_tx) => {
-                        crate::debug_println!(
-                            "[USER:{}] Coinslot found on subnet {}, relaying ACK…",
-                            ip, subnet
-                        );
-
-                        let (reply_tx, reply_rx) = mpsc::sync_channel::<RelayResult>(1);
-                        let relay_req = RelayRequest { reply_tx: Some(reply_tx), command: "ACK".to_string() };
-
-                        if coinslot_tx.send(relay_req).is_err() {
-                            crate::debug_println!("[USER:{}] Coinslot relay channel closed.", ip);
-                            let _ = ws.send(Message::Text(
-                                "{\"error\":\"Coinslot disconnected\"}".to_string().into(),
-                            ));
-                            continue;
-                        }
-
-                        // Wait up to 5 s for the coinslot thread to ping the ESP
-                        // and return the result.
-                        match reply_rx.recv_timeout(Duration::from_secs(5)) {
-                            Ok(RelayResult::Available) => {
-                                crate::debug_println!(
-                                    "[USER:{}] Coinslot confirmed available → ACK_SUCCESS",
-                                    ip
-                                );
-                                let mac = crate::utils::get_mac_from_ip::get_mac_from_ip(&ip).unwrap_or_default();
-                                ACTIVE_USER.lock().unwrap().insert(subnet.clone(), mac);
-                                let _ = ws.send(Message::Text(
-                                    "{\"type\":\"ACK_SUCCESS\"}".to_string().into(),
-                                ));
-                            }
-                            Ok(RelayResult::NotAvailable(reason)) => {
-                                crate::debug_println!("[USER:{}] Coinslot not available: {}", ip, reason);
-                                let _ = ws.send(Message::Text(
-                                    format!("{{\"error\":\"{}\"}}", reason).into(),
-                                ));
-                            }
-                            Ok(RelayResult::Timeout) | Err(_) => {
-                                crate::debug_println!("[USER:{}] Coinslot relay timed out.", ip);
-                                let _ = ws.send(Message::Text(
-                                    "{\"error\":\"Coinslot did not respond in time\"}"
-                                        .to_string()
-                                        .into(),
-                                ));
-                            }
-                        }
-                    }
-                }
+                break;
             } else {
-                crate::debug_println!("[USER:{}] Unhandled message type: {}", ip, ws_msg.msg_type);
+                crate::debug_println!(
+                    "[USER:{}] Unhandled message type: {}",
+                    ip,
+                    ws_msg.msg_type
+                );
             }
         } else {
-            crate::debug_println!("[USER:{}] Could not parse message: {}", ip, txt);
+            crate::debug_println!(
+                "[USER:{}] Could not parse message: {}",
+                ip,
+                txt
+            );
         }
     }
 
-    crate::debug_println!("[USER:{}] User thread exiting.", ip);
-    let mac = crate::utils::get_mac_from_ip::get_mac_from_ip(&ip).unwrap_or_default();
-    let mut active_map = ACTIVE_USER.lock().unwrap();
-    if active_map.get(&subnet) == Some(&mac) {
-        active_map.remove(&subnet);
-        // Force close if they disconnected unexpectedly
-        let sender = get_coinslot_senders().lock().unwrap().get(&subnet).cloned();
-        if let Some(coinslot_tx) = sender {
-            let _ = coinslot_tx.send(RelayRequest { reply_tx: None, command: "close".to_string() });
-        }
-    }
+    // Unexpected browser disconnection does not release the reservation.
+    // The 30-second lease expires in the coinslot thread instead.
+    crate::debug_println!(
+        "[USER:{}] User thread exiting; reservation will expire or be explicitly released.",
+        ip
+    );
 }
 
-pub fn handle_user_ack(ws: &mut WebSocket<Box<dyn ReadWrite + Send>>, ip: &str, subnet: &str) {
-    let sender = get_coinslot_senders().lock().unwrap().get(subnet).cloned();
+pub fn handle_user_ack(
+    ws: &mut WebSocket<Box<dyn ReadWrite + Send>>,
+    ip: &str,
+    subnet: &str,
+    owner_id: &str,
+    browser_token: Option<String>,
+) -> bool {
+    let mac = crate::utils::get_mac_from_ip::get_mac_from_ip(ip)
+        .unwrap_or_default();
 
-    match sender {
+    if !reserve_active_user(subnet, &mac, owner_id, browser_token) {
+        crate::debug_println!("[USER:{}] Coinslot is already reserved.", ip);
+
+        let _ = ws.send(Message::Text(
+            "{\"error\":\"Coinslot is currently in use by another user\"}"
+                .to_string()
+                .into(),
+        ));
+        return false;
+    }
+
+    let sender = get_coinslot_senders()
+        .lock()
+        .unwrap()
+        .get(subnet)
+        .cloned();
+
+    let coinslot_tx = match sender {
+        Some(tx) => tx,
         None => {
-            crate::debug_println!(
-                "[USER:{}] No coinslot on subnet {} → not available",
-                ip, subnet
-            );
+            release_active_user(subnet, owner_id);
+
             let _ = ws.send(Message::Text(
                 "{\"error\":\"Coinslot is not available\"}"
                     .to_string()
                     .into(),
             ));
+            return false;
         }
-        Some(coinslot_tx) => {
+    };
+
+    let (reply_tx, reply_rx) = mpsc::sync_channel::<RelayResult>(1);
+
+    if coinslot_tx
+        .send(RelayRequest {
+            reply_tx: Some(reply_tx),
+            command: "ACK".to_string(),
+        })
+        .is_err()
+    {
+        release_active_user(subnet, owner_id);
+
+        let _ = ws.send(Message::Text(
+            "{\"error\":\"Coinslot disconnected\"}"
+                .to_string()
+                .into(),
+        ));
+        return false;
+    }
+
+    match reply_rx.recv_timeout(Duration::from_secs(5)) {
+        Ok(RelayResult::Available) => {
             crate::debug_println!(
-                "[USER:{}] Relaying ACK to coinslot on subnet {}",
-                ip, subnet
+                "[USER:{}] Coinslot confirmed available.",
+                ip
             );
-            
-            let mac = crate::utils::get_mac_from_ip::get_mac_from_ip(ip).unwrap_or_default();
-            {
-                let active_map = ACTIVE_USER.lock().unwrap();
-                if let Some(active_mac) = active_map.get(subnet) {
-                    if active_mac != &mac {
-                        crate::debug_println!("[USER:{}] Coinslot is already in use by MAC {}", ip, active_mac);
-                        let _ = ws.send(Message::Text(
-                            "{\"error\":\"Coinslot is currently in use by another user\"}".to_string().into(),
-                        ));
-                        return;
-                    }
-                }
-            }
 
-            let (reply_tx, reply_rx) = mpsc::sync_channel::<RelayResult>(1);
-            if coinslot_tx.send(RelayRequest { reply_tx: Some(reply_tx), command: "ACK".to_string() }).is_err() {
-                let _ = ws.send(Message::Text(
-                    "{\"error\":\"Coinslot disconnected\"}".to_string().into(),
-                ));
-                return;
-            }
+            let _ = ws.send(Message::Text(
+                "{\"type\":\"ACK_SUCCESS\"}".to_string().into(),
+            ));
+            true
+        }
+        Ok(RelayResult::NotAvailable(reason)) => {
+            release_active_user(subnet, owner_id);
 
-            match reply_rx.recv_timeout(Duration::from_secs(5)) {
-                Ok(RelayResult::Available) => {
-                    crate::debug_println!("[USER:{}] ACK_SUCCESS", ip);
-                    let mac = crate::utils::get_mac_from_ip::get_mac_from_ip(ip).unwrap_or_default();
-                    ACTIVE_USER.lock().unwrap().insert(subnet.to_string(), mac);
-                    let _ = ws.send(Message::Text(
-                        "{\"type\":\"ACK_SUCCESS\"}".to_string().into(),
-                    ));
-                }
-                Ok(RelayResult::NotAvailable(reason)) => {
-                    crate::debug_println!("[USER:{}] Coinslot not available: {}", ip, reason);
-                    let _ = ws.send(Message::Text(
-                        format!("{{\"error\":\"{}\"}}", reason).into(),
-                    ));
-                }
-                Ok(RelayResult::Timeout) | Err(_) => {
-                    crate::debug_println!("[USER:{}] Coinslot relay timed out.", ip);
-                    let _ = ws.send(Message::Text(
-                        "{\"error\":\"Coinslot did not respond in time\"}"
-                            .to_string()
-                            .into(),
-                    ));
-                }
-            }
+            let error = serde_json::json!({ "error": reason });
+            let _ = ws.send(Message::Text(error.to_string().into()));
+            false
+        }
+        Ok(RelayResult::Timeout) | Err(_) => {
+            release_active_user(subnet, owner_id);
+
+            let _ = ws.send(Message::Text(
+                "{\"error\":\"Coinslot did not respond in time\"}"
+                    .to_string()
+                    .into(),
+            ));
+            false
         }
     }
 }

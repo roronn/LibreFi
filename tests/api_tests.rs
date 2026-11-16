@@ -6,7 +6,7 @@ use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use rand::RngCore;
 use serde_json::json;
 
-const BASE_URL: &str = "http://127.0.0.1:8000";
+const BASE_URL: &str = "http://127.0.0.1:8080";
 const ADMIN_KEY: &str = "arns_super_pogi_4ever";
 
 fn encrypt_payload(key_str: &str, payload: serde_json::Value) -> String {

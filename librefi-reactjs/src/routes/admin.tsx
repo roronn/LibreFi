@@ -9,7 +9,7 @@ import { Label } from "#components/ui/label";
 import { toast } from "#components/ui/toast";
 import { encrypt } from "#lib/utils";
 import { ArrowRight, Loader2 } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { Route, Switch, useLocation } from "wouter";
 
 function AdminLogin() {
@@ -34,13 +34,13 @@ function AdminLogin() {
             );
 
             if (res.ok) {
-                window.localStorage.setItem("adminkey", k);
+
                 setLocation("/dashboard");
                 return;
             }
 
             if (res.status === 401) {
-                window.localStorage.removeItem("adminkey");
+
                 toast.error("Invalid admin key", { position: "top-center" });
             } else if (res.status === 403) {
                 toast.error("Admin access blocked from this network", {
@@ -63,14 +63,7 @@ function AdminLogin() {
         }
     }
 
-    useEffect(() => {
-        (async () => {
-            const k = window.localStorage.getItem("adminkey");
-            if (k) await login(k, JSON.stringify({ "id": 1 }))
-        })()
-    }, []);
-
-    return (
+return (
         <>
             <div className="h-screen [@supports(height:100dvh)]:h-dvh w-screen grid place-items-center p-4">
                 <div className="max-w-sm w-full">
@@ -78,7 +71,7 @@ function AdminLogin() {
                     <p className="text-center text-sm text-foreground/60 pb-4">
                         Enter your admin key to proceed.
                     </p>
-                    <Input className="text-center" onChange={(e) => setKey(e.target.value)} value={key} id="adminkey" placeholder="e.g skfujrkehjdysi" />
+                    <Input className="text-center" onChange={(e) => setKey(e.target.value)} value={key} id="adminkey" autoComplete="new-password" name="librefi-admin-key" />
 
                     <div className="flex justify-center pt-6">
                         <Button disabled={isLoadling || !key} onClick={async () => await login(key, JSON.stringify({ "id": 1 }))} className="cursor-pointer" size="icon-lg">

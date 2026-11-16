@@ -18,7 +18,7 @@ function Progress({ timeLeft, totalCoins }: { timeLeft: number; totalCoins: numb
         <div className="relative flex justify-center w-full">
             <CircularProgress progressClassName={`opacity-60 ${progress <= 25 ? "stroke-yellow-400" : "stroke-primary"}`} size={250} strokeWidth={15} value={progress} />
             <div className="w-full h-full grid place-items-center absolute top-0 left-0">
-                <h1 className="font-medium text-5xl text-foreground/70">₱{totalCoins}</h1>
+                <h1 className="font-medium text-5xl text-foreground/70">â‚±{totalCoins}</h1>
             </div>
         </div>
     </>)
@@ -28,6 +28,9 @@ function Coin({ children, onClose }: { children: ReactElement, onClose?: () => v
     const [isOpen, setIsOpen] = useState(false);
     const [timeLeft, setTimeLeft] = useState(30);
     const [totalCoins, setTotalCoins] = useState(0);
+    const [lastVoucher, setLastVoucher] = useState("");
+    const [recoveryStatus, setRecoveryStatus] = useState<boolean | null>(null);
+    const [isCheckingRecovery, setIsCheckingRecovery] = useState(false);
     const wsRef = useRef<WebSocket | null>(null);
     const pingRef = useRef<number | null>(null);
     const timerRef = useRef<number | null>(null);
@@ -53,6 +56,34 @@ function Coin({ children, onClose }: { children: ReactElement, onClose?: () => v
         onClose?.();
     }
 
+    async function loadLastVoucher() {
+        const savedVoucher = localStorage.getItem("librefi_last_voucher") || "";
+        setLastVoucher(savedVoucher);
+        setRecoveryStatus(null);
+
+        if (!savedVoucher) return;
+
+        setIsCheckingRecovery(true);
+        try {
+            const response = await fetch("/api/voucher/recovery-status", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ code: savedVoucher })
+            });
+
+            if (response.ok) {
+                const data = await response.json();
+                if (typeof data.recoverable === "boolean") {
+                    setRecoveryStatus(data.recoverable);
+                }
+            }
+        } catch (error) {
+            console.error("Failed to check last voucher recovery status", error);
+        } finally {
+            setIsCheckingRecovery(false);
+        }
+    }
+
     function handleCoin() {
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
         const wsUrl = `${protocol}//${window.location.host}/ws`;
@@ -66,15 +97,19 @@ function Coin({ children, onClose }: { children: ReactElement, onClose?: () => v
         const timeoutId = setTimeout(() => {
             toast.dismiss(loadingToast);
             toast.error("Coinslot is not available!", {
-                description: "Cannot contact coinslot within 4 seconds.",
+                description: "Cannot contact coinslot within 6 seconds.",
                 position: "top-center"
             });
             ws.close();
             wsRef.current = null;
-        }, 4000);
+        }, 6000);
 
         ws.onopen = () => {
-            ws.send(JSON.stringify({ type: "ACK" }));
+            const browserToken = localStorage.getItem("librefi_browser_token");
+            ws.send(JSON.stringify({
+                type: "ACK",
+                value: browserToken
+            }));
         };
 
         ws.onmessage = (event) => {
@@ -92,6 +127,7 @@ function Coin({ children, onClose }: { children: ReactElement, onClose?: () => v
                 } else if (data.ok || data.status === "ok" || data.type === "ACK_SUCCESS") {
                     clearTimeout(timeoutId);
                     toast.dismiss(loadingToast);
+                    void loadLastVoucher();
                     setIsOpen(true);
                     setTimeLeft(29);
 
@@ -124,6 +160,13 @@ function Coin({ children, onClose }: { children: ReactElement, onClose?: () => v
                 } else if (data.type === "coin") {
                     let amount = data.value || 0;
                     let seconds = data.time || 0;
+
+                    if (
+                        typeof data.browser_token === "string" &&
+                        /^[0-9a-fA-F]{64}$/.test(data.browser_token)
+                    ) {
+                        localStorage.setItem("librefi_browser_token", data.browser_token);
+                    }
 
                     let timeStr = "";
                     if (seconds >= 3600) {
@@ -174,6 +217,26 @@ function Coin({ children, onClose }: { children: ReactElement, onClose?: () => v
                 </DialogHeader>
                 <div className="flex flex-col gap-3">
                     <Progress timeLeft={timeLeft} totalCoins={totalCoins} />
+
+                    {lastVoucher && (
+                        <div className="rounded-md border p-3 text-sm">
+                            <p className="font-medium">Your last voucher</p>
+                            <p className="font-mono text-base">{lastVoucher}</p>
+                            {isCheckingRecovery ? (
+                                <p className="mt-2 text-muted-foreground">
+                                    Checking voucher recovery status...
+                                </p>
+                            ) : recoveryStatus === true ? (
+                                <p className="mt-2">
+                                    Your last voucher is still recoverable. Keep it safe! You can use this code to recover your session if you lose your connection or need to log in.
+                                </p>
+                            ) : recoveryStatus === false ? (
+                                <p className="mt-2">
+                                    Your previous voucher could not be recovered. Your session has expired. Please purchase a new voucher or insert coins.
+                                </p>
+                            ) : null}
+                        </div>
+                    )}
 
                     <Button onClick={closeModal} className="w-full cursor-pointer hover:bg-primary/80" >
                         Done

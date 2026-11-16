@@ -23,7 +23,18 @@ struct DeleteRatePayload {
     id: u32,
 }
 
-pub fn handle_rates(server: &mut Server) {
+
+fn validate_rate(price: f64, time: u32) -> Result<(), &'static str> {
+    if !price.is_finite() || price <= 0.0 {
+        return Err("Rate price must be a finite number greater than zero");
+    }
+
+    if time == 0 {
+        return Err("Rate time must be greater than zero");
+    }
+
+    Ok(())
+}pub fn handle_rates(server: &mut Server) {
     server.post("/api/admin/rates", |req, res| {
         let json = match parse_admin_payload(req) {
             Ok(j) => j,
@@ -44,6 +55,13 @@ pub fn handle_rates(server: &mut Server) {
                 return;
             }
         };
+
+        if let Err(message) = validate_rate(payload.price, payload.time) {
+            res.status = 400;
+            res.body = serde_json::json!({ "error": message }).to_string().into_bytes();
+            res.content_type = String::from("application/json");
+            return;
+        }
 
         let rate = Rate {
             price: payload.price,
@@ -100,6 +118,13 @@ pub fn handle_rates(server: &mut Server) {
                 return;
             }
         };
+
+        if let Err(message) = validate_rate(payload.price, payload.time) {
+            res.status = 400;
+            res.body = serde_json::json!({ "error": message }).to_string().into_bytes();
+            res.content_type = String::from("application/json");
+            return;
+        }
 
         let rate = Rate {
             price: payload.price,

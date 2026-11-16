@@ -1,14 +1,16 @@
-use crate::network::server::Server;
+﻿use crate::network::server::Server;
 use crate::utils::db::{VOUCHERS_TABLE, Voucher, get_db};
-use serde::Deserialize;
+use rand::Rng;
+use redb::{ReadableDatabase, ReadableTable};
+use serde::{Deserialize, Serialize};
 
 use super::auth::parse_admin_payload;
 
 #[derive(Deserialize)]
 struct InsertVoucherPayload {
-    code: String,
     price: f64,
     time: u32,
+    quantity: usize,
 }
 
 #[derive(Deserialize)]
@@ -16,9 +18,22 @@ struct DeleteVoucherPayload {
     code: String,
 }
 
-use redb::{ReadableDatabase, ReadableTable};
-use serde::Serialize;
+#[derive(Deserialize)]
+struct PdfDownloadPayload {
+    codes: Vec<String>,
+}
 
+#[derive(Serialize)]
+struct PdfDownloadCount {
+    code: String,
+    count: u32,
+}
+
+#[derive(Serialize)]
+struct PdfDownloadResponse {
+    ok: bool,
+    updated: Vec<PdfDownloadCount>,
+}
 #[derive(Deserialize, Default)]
 struct GetVouchersPayload {
     page: Option<usize>,
@@ -32,29 +47,18 @@ struct VouchersListResponse {
     current_page: usize,
 }
 
+#[derive(Serialize)]
+struct VouchersBatchResponse {
+    ok: bool,
+    vouchers: Vec<Voucher>,
+}
+
 fn generate_random_code() -> String {
-    let chars: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
-    let mut buf = [0u8; 6];
+    const CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+    let mut rng = rand::thread_rng();
 
-    #[cfg(unix)]
-    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-        use std::io::Read;
-        let _ = f.read_exact(&mut buf);
-    }
-
-    #[cfg(not(unix))]
-    {
-        // Fallback: mix of multiple timestamps
-        let t1 = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let bytes = t1.to_ne_bytes();
-        buf.copy_from_slice(&bytes[..6]);
-    }
-
-    buf.iter()
-        .map(|b| chars[(*b as usize) % chars.len()] as char)
+    (0..6)
+        .map(|_| CHARS[rng.gen_range(0..CHARS.len())] as char)
         .collect()
 }
 
@@ -118,6 +122,7 @@ pub fn handle_vouchers(server: &mut Server) {
         res.body = serde_json::to_vec(&resp).unwrap();
         res.content_type = String::from("application/json");
     });
+
     server.post("/api/admin/vouchers", |req, res| {
         let json = match parse_admin_payload(req) {
             Ok(j) => j,
@@ -139,44 +144,215 @@ pub fn handle_vouchers(server: &mut Server) {
             }
         };
 
-        let mut code = payload.code.clone();
-        if code == "RANDOM" {
-            code = generate_random_code();
+        if !payload.price.is_finite()
+            || payload.price <= 0.0
+            || payload.time == 0
+            || payload.quantity == 0
+            || payload.quantity > 500
+        {
+            res.status = 400;
+            res.body = br#"{"error":"Price and time must be positive, and quantity must be between 1 and 500."}"#.to_vec();
+            res.content_type = String::from("application/json");
+            return;
         }
 
-        let voucher = Voucher {
-            code: code.clone(),
-            price: payload.price,
-            time: payload.time,
-            used: false,
-            created_at: Some(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs(),
-            ),
+        let db = get_db();
+        let write_txn = match db.begin_write() {
+            Ok(txn) => txn,
+            Err(e) => {
+                res.status = 500;
+                res.body = format!("{{\"error\":\"Database error: {}\"}}", e).into_bytes();
+                res.content_type = String::from("application/json");
+                return;
+            }
         };
 
-        let json_value = serde_json::to_string(&voucher).unwrap();
-        let db = get_db();
-        let write_txn = db.begin_write().unwrap();
-        {
-            let mut table = write_txn.open_table(VOUCHERS_TABLE).unwrap();
-            table.insert(code.as_str(), json_value.as_str()).unwrap();
-        }
-        write_txn.commit().unwrap();
+        let mut generated = Vec::with_capacity(payload.quantity);
+        let mut generation_error = None;
 
-        crate::debug_println!("-> Voucher [code={}] inserted: {}", code, json_value);
+        {
+            let mut table = match write_txn.open_table(VOUCHERS_TABLE) {
+                Ok(table) => table,
+                Err(e) => {
+                    res.status = 500;
+                    res.body = format!("{{\"error\":\"Database error: {}\"}}", e).into_bytes();
+                    res.content_type = String::from("application/json");
+                    return;
+                }
+            };
+
+            for _ in 0..payload.quantity {
+                let mut unique_code = None;
+
+                for _ in 0..100 {
+                    let candidate = generate_random_code();
+
+                    match table.get(candidate.as_str()) {
+                        Ok(existing) => {
+                            if existing.is_none() {
+                                unique_code = Some(candidate);
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            generation_error = Some(format!("Database error: {}", e));
+                            break;
+                        }
+                    }
+                }
+
+                if generation_error.is_some() {
+                    break;
+                }
+
+                let code = match unique_code {
+                    Some(code) => code,
+                    None => {
+                        generation_error = Some(
+                            "Unable to generate a unique voucher code. Please try again.".to_string()
+                        );
+                        break;
+                    }
+                };
+
+                let created_at = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+
+                let voucher = Voucher {
+                    code: code.clone(),
+                    price: payload.price,
+                    time: payload.time,
+                    used: false,
+                    pdf_download_count: 0,
+                    created_at: Some(created_at),
+                    session_id: None,
+                    redeemed_at: None,
+                };
+
+                let json_value = match serde_json::to_string(&voucher) {
+                    Ok(value) => value,
+                    Err(e) => {
+                        generation_error = Some(format!("Serialization error: {}", e));
+                        break;
+                    }
+                };
+
+                if let Err(e) = table.insert(code.as_str(), json_value.as_str()) {
+                    generation_error = Some(format!("Database error: {}", e));
+                    break;
+                }
+
+                generated.push(voucher);
+            }
+        }
+
+        if let Some(error) = generation_error {
+            drop(write_txn);
+            res.status = 500;
+            res.body = serde_json::json!({ "error": error }).to_string().into_bytes();
+            res.content_type = String::from("application/json");
+            return;
+        }
+
+        if let Err(e) = write_txn.commit() {
+            res.status = 500;
+            res.body = format!("{{\"error\":\"Database commit failed: {}\"}}", e).into_bytes();
+            res.content_type = String::from("application/json");
+            return;
+        }
+
+        crate::debug_println!("-> Generated batch of {} vouchers", generated.len());
+
+        let response = VouchersBatchResponse {
+            ok: true,
+            vouchers: generated,
+        };
 
         res.status = 200;
-        res.body = format!(
-            "{{\"ok\":true,\"code\":\"{}\",\"voucher\":{}}}",
-            code, json_value
-        )
-        .into_bytes();
+        res.body = serde_json::to_vec(&response).unwrap();
         res.content_type = String::from("application/json");
     });
 
+    server.post("/api/admin/vouchers/pdf-download", |req, res| {
+        let json = match parse_admin_payload(req) {
+            Ok(j) => j,
+            Err((status, body)) => {
+                res.status = status;
+                res.body = body;
+                res.content_type = String::from("application/json");
+                return;
+            }
+        };
+
+        let payload: PdfDownloadPayload = match serde_json::from_str(&json) {
+            Ok(p) => p,
+            Err(e) => {
+                res.status = 400;
+                res.body = format!("{{\"error\":\"Invalid PDF download payload: {}\"}}", e).into_bytes();
+                res.content_type = String::from("application/json");
+                return;
+            }
+        };
+
+        if payload.codes.is_empty() {
+            res.status = 400;
+            res.body = b"{\"error\":\"No voucher codes supplied\"}".to_vec();
+            res.content_type = String::from("application/json");
+            return;
+        }
+
+        let db = get_db();
+        let write_txn = db.begin_write().unwrap();
+        let mut updated: Vec<PdfDownloadCount> = Vec::new();
+
+        {
+            let mut table = write_txn.open_table(VOUCHERS_TABLE).unwrap();
+
+            for code in &payload.codes {
+                if updated.iter().any(|item| item.code == *code) {
+                    continue;
+                }
+
+                let existing_json = match table.get(code.as_str()).unwrap() {
+                    Some(value) => value.value().to_string(),
+                    None => continue,
+                };
+
+                let mut voucher: Voucher = match serde_json::from_str(&existing_json) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+
+                if voucher.used {
+                    continue;
+                }
+
+                voucher.pdf_download_count =
+                    voucher.pdf_download_count.saturating_add(1);
+
+                let updated_json = serde_json::to_string(&voucher).unwrap();
+                table.insert(code.as_str(), updated_json.as_str()).unwrap();
+
+                updated.push(PdfDownloadCount {
+                    code: code.clone(),
+                    count: voucher.pdf_download_count,
+                });
+            }
+        }
+
+        write_txn.commit().unwrap();
+
+        let response = PdfDownloadResponse {
+            ok: true,
+            updated,
+        };
+
+        res.status = 200;
+        res.body = serde_json::to_vec(&response).unwrap();
+        res.content_type = String::from("application/json");
+    });
     server.delete("/api/admin/vouchers", |req, res| {
         let json = match parse_admin_payload(req) {
             Ok(j) => j,
@@ -220,3 +396,5 @@ pub fn handle_vouchers(server: &mut Server) {
         res.content_type = String::from("application/json");
     });
 }
+
+

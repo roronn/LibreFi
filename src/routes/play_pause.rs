@@ -1,108 +1,144 @@
-
 use crate::network::server::Server;
-use crate::utils::db::{USERS_TABLE, User, get_db};
+use crate::utils::db::{
+    current_timestamp, find_session_by_mac, get_db, Session, SESSIONS_TABLE,
+};
 use crate::utils::get_mac_from_ip::get_mac_from_ip;
-use redb::ReadableDatabase;
-use std::time::{SystemTime, UNIX_EPOCH};
+use redb::ReadableTable;
 
 pub fn play_pause(server: &mut Server) {
     server.post("/api/play_pause", |req, res| {
         let Some(mac) = get_mac_from_ip(&req.ip) else {
             res.status = 403;
             res.body = b"{\"error\":\"Device not recognized\"}".to_vec();
-            res.content_type = String::from("application/json");
+            res.content_type = "application/json".to_string();
             return;
         };
 
-        let db = get_db();
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as u32;
-
-        let read_txn = db.begin_read().unwrap();
-        let table = read_txn.open_table(USERS_TABLE).unwrap();
-
-        let mut user: User = match table.get(mac.as_str()).unwrap() {
-            None => {
+        let session_id = match find_session_by_mac(&mac) {
+            Ok(Some(id)) => id,
+            Ok(None) => {
                 res.status = 404;
-                res.body = b"{\"error\":\"User not found\"}".to_vec();
-                res.content_type = String::from("application/json");
+                res.body = b"{\"error\":\"Session not found\"}".to_vec();
+                res.content_type = "application/json".to_string();
                 return;
             }
-            Some(r) => match serde_json::from_str(r.value()) {
-                Ok(u) => u,
-                Err(_) => {
-                    res.status = 500;
-                    res.body = b"{\"error\":\"Corrupted user record\"}".to_vec();
-                    res.content_type = String::from("application/json");
-                    return;
-                }
-            },
+            Err(_) => {
+                res.status = 500;
+                res.body = b"{\"error\":\"Could not find session\"}".to_vec();
+                res.content_type = "application/json".to_string();
+                return;
+            }
         };
 
-        drop(table);
-        drop(read_txn);
+        let now = current_timestamp();
+        let db = get_db();
+        let write_txn = match db.begin_write() {
+            Ok(txn) => txn,
+            Err(_) => {
+                res.status = 500;
+                res.body = b"{\"error\":\"Could not update session\"}".to_vec();
+                res.content_type = "application/json".to_string();
+                return;
+            }
+        };
 
-        let action: &str;
+        let mut session: Session = {
+            let table = match write_txn.open_table(SESSIONS_TABLE) {
+                Ok(table) => table,
+                Err(_) => {
+                    res.status = 500;
+                    res.body = b"{\"error\":\"Could not open session table\"}".to_vec();
+                    res.content_type = "application/json".to_string();
+                    return;
+                }
+            };
+            match table.get(session_id.as_str()) {
+                Ok(Some(value)) => match serde_json::from_str(value.value()) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        res.status = 500;
+                        res.body = b"{\"error\":\"Corrupted session record\"}".to_vec();
+                        res.content_type = "application/json".to_string();
+                        return;
+                    }
+                },
+                Ok(None) => {
+                    res.status = 404;
+                    res.body = b"{\"error\":\"Session not found\"}".to_vec();
+                    res.content_type = "application/json".to_string();
+                    return;
+                }
+                Err(_) => {
+                    res.status = 500;
+                    res.body = b"{\"error\":\"Could not read session\"}".to_vec();
+                    res.content_type = "application/json".to_string();
+                    return;
+                }
+            }
+        };
 
-        if user.paused {
-            let remaining = user.expires_on.saturating_sub(user.paused_on);
-            user.expires_on = now + remaining;
-            user.paused = false;
-            user.paused_on = 0;
-            action = "play";
-        } else {
-            user.paused_on = now;
-            user.paused = true;
-            action = "pause";
-        }
-
-        let write_txn = db.begin_write().unwrap();
+        let paused = !session.paused;
+        session.set_paused(paused, now);
+        let action = if paused { "pause" } else { "play" };
+        let remaining_seconds = session.remaining_seconds;
+        let pause_attempts = session.pause_attempts;
+        let session_json = match serde_json::to_string(&session) {
+            Ok(value) => value,
+            Err(_) => {
+                res.status = 500;
+                res.body = b"{\"error\":\"Could not serialize session\"}".to_vec();
+                res.content_type = "application/json".to_string();
+                return;
+            }
+        };
         {
-            let mut wtable = write_txn.open_table(USERS_TABLE).unwrap();
-            let json = serde_json::to_string(&user).unwrap();
-            wtable.insert(mac.as_str(), json.as_str()).unwrap();
+            let mut table = match write_txn.open_table(SESSIONS_TABLE) {
+                Ok(table) => table,
+                Err(_) => {
+                    res.status = 500;
+                    res.body = b"{\"error\":\"Could not open session table\"}".to_vec();
+                    res.content_type = "application/json".to_string();
+                    return;
+                }
+            };
+            if table.insert(session_id.as_str(), session_json.as_str()).is_err() {
+                res.status = 500;
+                res.body = b"{\"error\":\"Could not save session\"}".to_vec();
+                res.content_type = "application/json".to_string();
+                return;
+            }
         }
-        write_txn.commit().unwrap();
+        if write_txn.commit().is_err() {
+            res.status = 500;
+            res.body = b"{\"error\":\"Could not commit session update\"}".to_vec();
+            res.content_type = "application/json".to_string();
+            return;
+        }
 
         crate::debug_println!(
-            "-> [{}] MAC={} paused={} expires_on={} pause_attempts={}",
-            action, mac, user.paused, user.expires_on, user.pause_attempts
+            "-> [{}] MAC={} paused={} remaining_seconds={} pause_attempts={}",
+            action, mac, session.paused, session.remaining_seconds, session.pause_attempts
         );
 
-        // OpenWrt firewall commands are only needed on the actual device.
         #[cfg(not(windows))]
         {
-            if user.paused {
-                let cmd = format!(
-                    "nft delete element inet librefi allowed_macs {{ {} }}",
-                    mac
-                );
+            if session.paused || session.remaining_seconds == 0 {
+                let cmd = format!("nft delete element inet librefi allowed_macs {{ {} }}", mac);
                 let _ = crate::utils::setup_captive_portal::run_sh_cmd(&cmd, true);
             } else {
-                let diff = user.expires_on.saturating_sub(now);
-                if diff > 0 {
-                    let cmd = format!(
-                        "nft add element inet librefi allowed_macs {{ {} timeout {}s }}",
-                        mac, diff
-                    );
-                    let _ = crate::utils::setup_captive_portal::run_sh_cmd(&cmd, true);
-                }
+                let cmd = format!("nft add element inet librefi allowed_macs {{ {} timeout {}s }}", mac, session.remaining_seconds);
+                let _ = crate::utils::setup_captive_portal::run_sh_cmd(&cmd, true);
             }
         }
 
         res.status = 200;
         res.body = serde_json::json!({
             "action": action,
-            "paused": user.paused,
-            "paused_on": user.paused_on,
-            "expires_on": user.expires_on,
-            "pause_attempts": user.pause_attempts,
+            "paused": session.paused,
+            "pause_attempts": pause_attempts,
+            "remaining_seconds": remaining_seconds,
             "now": now,
-        })
-        .to_string()
-        .into_bytes();
-        res.content_type = String::from("application/json");
+        }).to_string().into_bytes();
+        res.content_type = "application/json".to_string();
     });
 }

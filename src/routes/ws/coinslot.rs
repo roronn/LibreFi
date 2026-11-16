@@ -6,12 +6,12 @@ use tungstenite::protocol::{Message, WebSocket};
 
 use crate::routes::admin::coinslot_key::get_coinslot_key_bytes;
 use crate::utils::crypto::decrypt_payload;
-use crate::utils::db::{add_time_to_user, convert_amount_to_time, record_sale};
-use crate::utils::setup_captive_portal::allow_mac;
+use crate::utils::db::{credit_session_for_payment, convert_amount_to_time, find_session_by_mac};
 
 use super::state::{
-    ACTIVE_USER, EncryptedPayload, RelayRequest, RelayResult, USER_EVENTS, WsMessage,
-    get_coinslot_senders,
+    EncryptedPayload, RelayRequest, RelayResult, USER_EVENTS, WsMessage,
+    expire_active_user, get_active_user, get_coinslot_senders,
+    update_active_user_browser_token,
 };
 
 pub fn run_coinslot(mut ws: WebSocket<Box<dyn ReadWrite + Send>>, subnet: String, _ip: String) {
@@ -28,17 +28,29 @@ pub fn run_coinslot(mut ws: WebSocket<Box<dyn ReadWrite + Send>>, subnet: String
     );
 
     loop {
+        // Expire abandoned browser reservations after their heartbeat lease ends.
+        if expire_active_user(&subnet) {
+            crate::debug_println!(
+                "[CS:{}] Browser reservation expired; closing ESP coinslot.",
+                subnet
+            );
+
+            let _ = ws.send(Message::Text(
+                "{\"type\":\"cmd\",\"value\":\"close\"}".to_string().into(),
+            ));
+        }
+
         match rx.try_recv() {
             Ok(req) => {
                 if req.command == "ACK" {
-                    crate::debug_println!("[CS:{}] Relaying ACK to ESP device…", subnet);
+                    crate::debug_println!("[CS:{}] Relaying ACK to ESP device...", subnet);
 
                     if ws
                         .send(Message::Text("{\"type\":\"ACK\"}".to_string().into()))
                         .is_err()
                     {
                         crate::debug_println!(
-                            "[CS:{}] Failed to send ACK to ESP — connection dead.",
+                            "[CS:{}] Failed to send ACK to ESP - connection dead.",
                             subnet
                         );
                         if let Some(reply_tx) = req.reply_tx {
@@ -61,7 +73,10 @@ pub fn run_coinslot(mut ws: WebSocket<Box<dyn ReadWrite + Send>>, subnet: String
             }
             Err(mpsc::TryRecvError::Empty) => {}
             Err(mpsc::TryRecvError::Disconnected) => {
-                crate::debug_println!("[CS:{}] Relay channel dropped — cleaning up.", subnet);
+                crate::debug_println!(
+                    "[CS:{}] Relay channel dropped - cleaning up.",
+                    subnet
+                );
                 break;
             }
         }
@@ -75,7 +90,10 @@ pub fn run_coinslot(mut ws: WebSocket<Box<dyn ReadWrite + Send>>, subnet: String
                         handle_esp_message(&plain, &subnet);
                     }
                     None => {
-                        crate::debug_println!("[CS:{}] Rejected unencrypted/invalid message.", subnet);
+                        crate::debug_println!(
+                            "[CS:{}] Rejected unencrypted/invalid message.",
+                            subnet
+                        );
                     }
                 }
             }
@@ -91,20 +109,22 @@ pub fn run_coinslot(mut ws: WebSocket<Box<dyn ReadWrite + Send>>, subnet: String
                 std::thread::sleep(Duration::from_millis(20));
             }
             Err(e) => {
-                crate::debug_println!("[CS:{}] Read error: {} — disconnecting.", subnet, e);
+                crate::debug_println!(
+                    "[CS:{}] Read error: {} - disconnecting.",
+                    subnet,
+                    e
+                );
                 break;
             }
         }
     }
 
-    // Clean up the sender so user threads don't try to use a stale entry.
     get_coinslot_senders().lock().unwrap().remove(&subnet);
 
     crate::debug_println!("[CS:{}] Coinslot thread exiting.", subnet);
 }
 
-/// Block (with timeout) reading from `ws` until we get a response that tells
-/// us whether the ESP coinslot is actually available.
+/// Wait for the ESP to confirm that the coinslot is available.
 pub fn wait_for_coinslot_ack(
     ws: &mut WebSocket<Box<dyn ReadWrite + Send>>,
     timeout: Duration,
@@ -120,14 +140,18 @@ pub fn wait_for_coinslot_ack(
                 let plain = match try_decrypt_esp_msg(txt) {
                     Some(p) => p,
                     None => {
-                        crate::debug_println!("[CS relay] Rejected unencrypted reply — still waiting…");
+                        crate::debug_println!(
+                            "[CS relay] Rejected unencrypted reply - still waiting..."
+                        );
                         continue;
                     }
                 };
 
                 crate::debug_println!("[CS relay] ESP decrypted reply: {}", plain);
+
                 if let Ok(doc) = serde_json::from_str::<serde_json::Value>(&plain) {
                     let t = doc["type"].as_str().unwrap_or("");
+
                     if t == "ACK_SUCCESS"
                         || t == "ping"
                         || t == "notify"
@@ -136,11 +160,13 @@ pub fn wait_for_coinslot_ack(
                     {
                         return RelayResult::Available;
                     }
+
                     if doc["error"].is_string() {
                         return RelayResult::NotAvailable(
                             doc["error"].as_str().unwrap_or("Unknown error").to_string(),
                         );
                     }
+
                     return RelayResult::Available;
                 }
             }
@@ -159,6 +185,7 @@ pub fn wait_for_coinslot_ack(
             }
         }
     }
+
     RelayResult::Timeout
 }
 
@@ -192,71 +219,144 @@ pub fn try_decrypt_esp_msg(txt: &str) -> Option<String> {
     } else {
         crate::debug_println!("[CS-DEBUG] No coinslot key found in database!");
     }
+
     None
 }
 
 pub fn handle_esp_message(txt: &str, subnet: &str) {
     if let Ok(mut doc) = serde_json::from_str::<WsMessage>(txt) {
         match doc.msg_type.as_str() {
-            "ping" => {} // Heartbeat — silently ignored, only used to unblock ws.read()
-            "init" => crate::debug_println!("[CS:{}] ESP init: {:?}", subnet, doc.value),
-            "res" => crate::debug_println!("[CS:{}] ESP slot response: {:?}", subnet, doc.value),
-            "timer" => {
-                let active_map = ACTIVE_USER.lock().unwrap();
-                if let Some(mac) = active_map.get(subnet) {
+            "ping" => {}
+            "init" => crate::debug_println!("[CS:{}] ESP init received", subnet),
+            "res" => crate::debug_println!("[CS:{}] ESP slot response received", subnet),
+
+            "timer" | "notify" => {
+                if doc.msg_type == "notify" {
+                    crate::debug_println!("[CS:{}] ESP coin pulse detected", subnet);
+                }
+
+                if let Some(active) = get_active_user(subnet) {
                     let mut events = USER_EVENTS.lock().unwrap();
-                    events.entry(mac.clone()).or_insert_with(Vec::new).push(doc);
+                    events
+                        .entry(active.owner_id)
+                        .or_insert_with(Vec::new)
+                        .push(doc);
                 }
             }
-            "notify" => {
-                crate::debug_println!("[CS:{}] ESP coin pulse detected", subnet);
-                let active_map = ACTIVE_USER.lock().unwrap();
-                if let Some(mac) = active_map.get(subnet) {
-                    let mut events = USER_EVENTS.lock().unwrap();
-                    events.entry(mac.clone()).or_insert_with(Vec::new).push(doc);
-                }
-            }
+
             "coin" => {
                 let amount: u32 = match &doc.value {
-                    Some(v) if v.is_u64() => v.as_u64().unwrap_or(0) as u32,
-                    Some(v) if v.is_string() => v.as_str().unwrap().parse().unwrap_or(0),
+                    Some(v) if v.is_u64() => {
+                        v.as_u64().unwrap_or(0).min(u32::MAX as u64) as u32
+                    }
+                    Some(v) if v.is_string() => {
+                        v.as_str().unwrap_or("").parse().unwrap_or(0)
+                    }
                     _ => 0,
                 };
-                crate::debug_println!("[CS:{}] ESP coin inserted, amount: {}", subnet, amount);
 
-                let active_map = ACTIVE_USER.lock().unwrap();
-                if let Some(mac) = active_map.get(subnet) {
+                crate::debug_println!(
+                    "[CS:{}] ESP coin inserted, amount: {}",
+                    subnet,
+                    amount
+                );
+
+                if let Some(active) = get_active_user(subnet) {
+                    let mac = active.mac.clone();
+                    let owner_id = active.owner_id.clone();
+                    let previous_browser_token = active.browser_token.clone();
                     let seconds = convert_amount_to_time(amount);
-                    if seconds > 0 {
-                        record_sale(amount);
-                        if let Ok(user) = add_time_to_user(mac, seconds) {
-                            if !user.paused {
-                                allow_mac(mac);
+
+                    if seconds > 0 && amount > 0 {
+                        match find_session_by_mac(&mac) {
+                            Ok(Some(session_id)) => {
+                                match credit_session_for_payment(
+                                    &session_id,
+                                    &mac,
+                                    seconds as u64,
+                                    Some(amount),
+                                ) {
+                                    Ok((credited_session_id, session, browser_token)) => {
+                                        doc.time = Some(serde_json::json!(seconds));
+
+                                        if let Some(new_token) = browser_token {
+                                            if update_active_user_browser_token(
+                                                subnet,
+                                                &owner_id,
+                                                previous_browser_token.as_deref(),
+                                                new_token.clone(),
+                                            ) {
+                                                doc.browser_token = Some(new_token);
+                                            } else {
+                                                crate::debug_println!(
+                                                    "[CS:{}] Replacement token was not assigned because the active browser reservation changed or expired.",
+                                                    subnet
+                                                );
+                                            }
+                                        }
+
+                                        crate::debug_println!(
+                                            "[CS:{}] Credited {} seconds to session {}",
+                                            subnet,
+                                            seconds,
+                                            credited_session_id
+                                        );
+
+                                        crate::debug_println!(
+                                            "[CS:{}] Session balance is now {} seconds",
+                                            subnet,
+                                            session.remaining_seconds
+                                        );
+                                    }
+                                    Err(error) => {
+                                        crate::debug_println!(
+                                            "[CS:{}] Failed to credit session: {}",
+                                            subnet,
+                                            error
+                                        );
+                                    }
+                                }
                             }
-                            doc.time = Some(serde_json::json!(seconds));
-                            crate::debug_println!(
-                                "[CS:{}] Credited {} seconds to MAC {}",
-                                subnet, seconds, mac
-                            );
-                        } else {
-                            crate::debug_println!(
-                                "[CS:{}] Failed to credit time: user {} not found",
-                                subnet, mac
-                            );
+                            Ok(None) => {
+                                crate::debug_println!(
+                                    "[CS:{}] No session is linked to MAC {}",
+                                    subnet,
+                                    mac
+                                );
+                            }
+                            Err(error) => {
+                                crate::debug_println!(
+                                    "[CS:{}] Could not find session: {}",
+                                    subnet,
+                                    error
+                                );
+                            }
                         }
                     } else {
                         crate::debug_println!(
-                            "[CS:{}] Warning: 0 seconds calculated for amount {}. Are rates set?",
-                            subnet, amount
+                            "[CS:{}] Invalid or zero time for coin amount {}. Check rates.",
+                            subnet,
+                            amount
                         );
                     }
 
-                    // Always push the coin event so the frontend knows the coinslot finished
+                    // Forward the coin event even if crediting failed.
                     let mut events = USER_EVENTS.lock().unwrap();
-                    events.entry(mac.clone()).or_insert_with(Vec::new).push(doc);
+                    events.entry(owner_id).or_insert_with(Vec::new).push(doc);
+                } else {
+                    crate::debug_println!(
+                        "[CS:{}] Ignoring coin pulse because no active browser reservation exists.",
+                        subnet
+                    );
                 }
             }
-            other => crate::debug_println!("[CS:{}] Unknown ESP message type: {}", subnet, other),
+            other => {
+                crate::debug_println!(
+                    "[CS:{}] Unknown ESP message type: {}",
+                    subnet,
+                    other
+                );
+            }
         }
     }
 }

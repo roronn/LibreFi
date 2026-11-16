@@ -2,6 +2,7 @@ use super::auth::parse_admin_payload;
 use crate::network::server::Server;
 use crate::utils::db::{SALES_TABLE, USERS_TABLE, User, get_db};
 use redb::{ReadableDatabase, ReadableTable};
+#[cfg(not(windows))]
 use std::process::Command;
 use std::time::SystemTime;
 
@@ -17,6 +18,7 @@ pub fn handle_dashboard(server: &mut Server) {
             }
         };
 
+        #[cfg(not(windows))]
         let output = Command::new("sh")
             .arg("-c")
             .arg(r#"
@@ -26,12 +28,16 @@ pub fn handle_dashboard(server: &mut Server) {
             .output()
             .expect("Failed to execute shell command");
 
+        #[cfg(not(windows))]
         let mut sys_stats: serde_json::Value = if output.status.success() {
             let stdout = String::from_utf8_lossy(&output.stdout);
             serde_json::from_str(&stdout).unwrap_or_else(|_| serde_json::json!({}))
         } else {
             serde_json::json!({})
         };
+
+        #[cfg(windows)]
+        let mut sys_stats: serde_json::Value = serde_json::json!({});
 
         let db = get_db();
         let mut total_coins = 0;

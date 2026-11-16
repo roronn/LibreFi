@@ -1,4 +1,4 @@
-import Coin from "#components/Coin";
+﻿import Coin from "#components/Coin";
 import More, { Price } from "#components/More";
 import Timer from "#components/Timer";
 import { Button } from "#components/ui/button";
@@ -21,12 +21,27 @@ function User() {
     const [status, setStatus] = useState("--");
 
     const init = useCallback(async () => {
-        const res = await fetch(`/api/init?_=${Date.now()}`, {
+        const savedToken = localStorage.getItem("librefi_browser_token");
+        const params = new URLSearchParams({ _: String(Date.now()) });
+
+        if (savedToken) {
+            params.set("browser_token", savedToken);
+        }
+
+        const res = await fetch(`/api/init?${params.toString()}`, {
             method: "GET"
         });
 
         if (res.status === 200) {
             const json = await res.json();
+
+            if (
+                typeof json.browser_token === "string" &&
+                /^[0-9a-fA-F]{64}$/.test(json.browser_token)
+            ) {
+                localStorage.setItem("librefi_browser_token", json.browser_token);
+            }
+
             setUser(json);
         }
     }, []);
@@ -47,7 +62,7 @@ function User() {
                 setStatus("Connected");
 
                 const hasInternet =
-                    user && user.expires_on > user.now && !user.paused;
+                    user && user.remaining_seconds > 0 && !user.paused;
 
                 if (hasInternet && window.location.pathname !== "/") {
                     const url = new URL(window.location.href);
@@ -109,11 +124,10 @@ function User() {
             if (user) {
                 setUser({
                     ...user,
-                    expires_on: json.expires_on,
+                    remaining_seconds: json.remaining_seconds,
                     now: json.now,
                     pause_attempts: json.pause_attempts,
-                    paused: json.paused,
-                    paused_on: json.paused_on
+                    paused: json.paused
                 });
 
                 return json;
@@ -145,11 +159,6 @@ function User() {
         );
     }
 
-    function updateUser(expires_on: number, now: number) {
-        if (user) {
-            setUser({ ...user, expires_on, now });
-        }
-    }
 
     return (
         <div className="grid place-items-center min-h-screen [@supports(height:100dvh)]:min-h-dvh w-screen">
@@ -214,7 +223,28 @@ function User() {
                     </div>
 
                     <div className="flex flex-col items-center">
-                        <Voucher updateUser={updateUser}>
+                        <Voucher
+                            onRedeemed={(browserToken, redeemedCode) => {
+                                if (
+                                    browserToken &&
+                                    /^[0-9a-fA-F]{64}$/.test(browserToken)
+                                ) {
+                                    localStorage.setItem(
+                                        "librefi_browser_token",
+                                        browserToken
+                                    );
+                                }
+
+                                if (redeemedCode) {
+                                    localStorage.setItem(
+                                        "librefi_last_voucher",
+                                        redeemedCode
+                                    );
+                                }
+
+                                void init();
+                            }}
+                        >
                             <Button
                                 variant="outline"
                                 size="icon-lg"
@@ -259,7 +289,7 @@ function User() {
                     </div>
                 </nav>
                 <footer className="text-center mt-8 text-xs text-foreground/50">
-                    ©2026 LibreFi by @nel003
+                    Ã‚Â©2026 LibreFi by @nel003
                 </footer>
             </main>
         </div>
@@ -267,3 +297,4 @@ function User() {
 }
 
 export default User;
+

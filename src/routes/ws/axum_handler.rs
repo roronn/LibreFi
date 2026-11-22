@@ -304,7 +304,7 @@ async fn handle_socket(mut socket: WebSocket, ip: String) {
                     }
                 };
 
-                let payment: PaymentMessage = match serde_json::from_str(&plaintext) {
+                let payment: PaymentMessage = match serde_json::from_str::<PaymentMessage>(&plaintext) {
                     Ok(message) if message.msg_type == "PAYMENT" => message,
                     _ => {
                         reject_connection(&mut socket).await;

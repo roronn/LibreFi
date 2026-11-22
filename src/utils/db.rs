@@ -2262,6 +2262,38 @@ mod session_logic_tests {
         assert_eq!(active_result.remaining_seconds, 150);
         assert!(active_token.is_none());
 
+        let recovery_code = active_result
+            .recovery_voucher_code
+            .clone()
+            .expect("First coin payment must create a recovery voucher");
+        assert_eq!(recovery_code.len(), 24);
+        {
+            let read_txn = get_db().begin_read().unwrap();
+            let vouchers = read_txn.open_table(VOUCHERS_TABLE).unwrap();
+            let record = vouchers.get(recovery_code.as_str()).unwrap().unwrap();
+            let recovery_voucher: Voucher = serde_json::from_str(record.value()).unwrap();
+            assert!(recovery_voucher.used);
+            assert_eq!(recovery_voucher.time, 0);
+            assert_eq!(
+                recovery_voucher.session_id.as_deref(),
+                Some("test-active-session")
+            );
+            assert_eq!(
+                recovery_voucher.customer_id,
+                active_result.customer_id
+            );
+        }
+
+        // Subsequent coin payments reuse the same recovery voucher.
+        let (_, second_active_result, second_active_token) =
+            credit_session_for_payment("test-active-session", "test-mac-active", 10, None).unwrap();
+        assert_eq!(second_active_result.remaining_seconds, 160);
+        assert_eq!(
+            second_active_result.recovery_voucher_code.as_deref(),
+            Some(recovery_code.as_str())
+        );
+        assert!(second_active_token.is_none());
+
         // 2. An expired session must be replaced by a new session.
         let mut expired = Session::new(
             "Expired User".into(),

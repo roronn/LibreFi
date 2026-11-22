@@ -188,6 +188,29 @@ pub fn issue_customer_challenge(
     let mut challenges = write_txn
         .open_table(CUSTOMER_AUTH_CHALLENGES_TABLE)
         .map_err(|error| error.to_string())?;
+
+    // Keep the persistent challenge table bounded by pruning expired or used entries.
+    let expired_ids = challenges
+        .iter()
+        .map_err(|error| error.to_string())?
+        .map(|entry| {
+            let (key, value) = entry.map_err(|error| error.to_string())?;
+            let record: CustomerAuthChallenge =
+                serde_json::from_str(value.value()).map_err(|error| error.to_string())?;
+            Ok(if record.expires_at <= now || record.used_at.is_some() {
+                Some(key.value().to_string())
+            } else {
+                None
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    for expired_id in expired_ids {
+        challenges.remove(expired_id.as_str()).map_err(|error| error.to_string())?;
+    }
+
     challenges
         .insert(challenge_id.as_str(), record_json.as_str())
         .map_err(|error| error.to_string())?;
@@ -234,7 +257,7 @@ pub fn complete_customer_challenge(
         || challenge.purpose != purpose
         || challenge.key_hash != key_hash
         || challenge.used_at.is_some()
-        || challenge.expires_at < now
+        || challenge.expires_at <= now
     {
         return Err("Customer challenge is invalid or expired".to_string());
     }
@@ -403,6 +426,63 @@ mod tests {
             "challenge-2",
             "aabb"
         ).unwrap());
+    }
+
+    #[test]
+    fn registration_and_authentication_challenges_are_one_time() {
+        use crate::utils::db::{
+            Session, create_session_without_device, find_session_by_browser_token,
+            generate_browser_token, generate_secure_id, init_test_db_once,
+        };
+
+        init_test_db_once();
+        let session_id = generate_secure_id().unwrap();
+        let browser_token = generate_browser_token().unwrap();
+        let session = Session::new("Identity Test".to_string(), "127.0.0.1".to_string(), current_timestamp());
+        create_session_without_device(&session_id, &session, &browser_token).unwrap();
+
+        let signing_key = SigningKey::from_bytes(&[13u8; 32]);
+        let public_key = encode_hex(signing_key.verifying_key().as_bytes());
+
+        let (register_id, register_challenge, _) =
+            issue_customer_challenge("register", &public_key, Some(&browser_token)).unwrap();
+        let register_message = signature_message("register", &register_id, &register_challenge);
+        let register_signature = encode_hex(&signing_key.sign(&register_message).to_bytes());
+
+        let registered = complete_customer_challenge(
+            "register",
+            &register_id,
+            &public_key,
+            &register_signature,
+            Some(&browser_token),
+        ).unwrap();
+        assert_eq!(registered.session_id, session_id);
+        assert!(complete_customer_challenge(
+            "register",
+            &register_id,
+            &public_key,
+            &register_signature,
+            Some(&browser_token),
+        ).is_err());
+
+        let (auth_id, auth_challenge, _) =
+            issue_customer_challenge("authenticate", &public_key, None).unwrap();
+        let auth_message = signature_message("authenticate", &auth_id, &auth_challenge);
+        let auth_signature = encode_hex(&signing_key.sign(&auth_message).to_bytes());
+
+        let authenticated = complete_customer_challenge(
+            "authenticate",
+            &auth_id,
+            &public_key,
+            &auth_signature,
+            None,
+        ).unwrap();
+        assert_eq!(authenticated.session_id, session_id);
+        let recovered_token = authenticated.browser_token.unwrap();
+        assert_eq!(
+            find_session_by_browser_token(&recovered_token).unwrap().as_deref(),
+            Some(session_id.as_str())
+        );
     }
 
     #[test]

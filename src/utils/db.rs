@@ -2695,4 +2695,105 @@ mod session_logic_tests {
         ));
     }
 
+
+    #[test]
+    fn stress_test_ten_vendos_process_payments_concurrently() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        init_test_db_once();
+
+        const VENDO_COUNT: usize = 10;
+        let test_id = generate_secure_id().expect("test ID generation should succeed");
+        let barrier = Arc::new(Barrier::new(VENDO_COUNT + 1));
+        let mut workers = Vec::with_capacity(VENDO_COUNT);
+        let mut generations = Vec::with_capacity(VENDO_COUNT);
+        let mut expected_sessions = Vec::with_capacity(VENDO_COUNT);
+
+        // Prepare ten independently authenticated, online vendos. Each one
+        // owns a different customer session and active reservation.
+        for index in 0..VENDO_COUNT {
+            let (vendo, _credential) =
+                register_vendo(&format!("Concurrent Payment {test_id} {index}"))
+                    .expect("vendo registration should succeed");
+            let generation =
+                crate::routes::ws::state::register_vendo_connection(&vendo.vendo_id);
+
+            let session_id = format!("concurrent-payment-{test_id}-{index}");
+            let mac = format!("02:10:00:{:02x}:{:02x}:{:02x}", index / 256, index % 256, index + 1);
+            let token = format!("concurrent-token-{test_id}-{index}");
+            let mut session = Session::new(
+                format!("Concurrent Customer {index}"),
+                "127.0.0.1".to_string(),
+                current_timestamp(),
+            );
+            session.remaining_seconds = 100;
+            session.paused = true;
+
+            create_session(&session_id, &session, &mac, &token)
+                .expect("customer session creation should succeed");
+            reserve_vendo_for_customer_session(&vendo.vendo_id, &session_id)
+                .expect("each vendo should reserve its customer session");
+
+            let barrier_for_worker = Arc::clone(&barrier);
+            let session_for_worker = session_id.clone();
+            let vendo_for_worker = vendo.vendo_id.clone();
+            let event_id = format!("payment-{test_id}-{index}");
+
+            workers.push(thread::spawn(move || {
+                barrier_for_worker.wait();
+
+                credit_vendo_payment_for_session(
+                    &session_for_worker,
+                    60,
+                    VendoPaymentEvent {
+                        vendo_id: vendo_for_worker,
+                        event_id,
+                        sequence: 1,
+                        amount: 10,
+                        pulse_count: 1,
+                        device_timestamp: 1,
+                    },
+                )
+            }));
+
+            generations.push((vendo.vendo_id, generation));
+            expected_sessions.push(session_id);
+        }
+
+        // Release all ten payment workers together to contend for redb's
+        // serialized write transaction and verify every payment completes.
+        barrier.wait();
+
+        for (index, worker) in workers.into_iter().enumerate() {
+            let result = worker
+                .join()
+                .expect("payment worker thread should not panic")
+                .expect("concurrent payment should be accepted");
+
+            assert!(
+                matches!(result, VendoPaymentResult::Credited { .. }),
+                "Payment {index} should be credited exactly once"
+            );
+
+            let session = get_session(&expected_sessions[index])
+                .expect("session lookup should succeed")
+                .expect("customer session should still exist");
+            assert_eq!(
+                session.remaining_seconds, 160,
+                "Payment {index} should add 60 seconds to its own session"
+            );
+        }
+
+        for (vendo_id, generation) in generations {
+            assert!(
+                crate::routes::ws::state::unregister_vendo_connection(
+                    &vendo_id,
+                    generation,
+                ),
+                "Test vendo connection should unregister cleanly"
+            );
+        }
+    }
+
 }

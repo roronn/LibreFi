@@ -2714,7 +2714,7 @@ mod session_logic_tests {
         // owns a different customer session and active reservation.
         for index in 0..VENDO_COUNT {
             let (vendo, _credential) =
-                register_vendo(&format!("Concurrent Payment {test_id} {index}"))
+                register_vendo(&format!("Stress Vendo {index}"))
                     .expect("vendo registration should succeed");
             let generation =
                 crate::routes::ws::state::register_vendo_connection(&vendo.vendo_id);

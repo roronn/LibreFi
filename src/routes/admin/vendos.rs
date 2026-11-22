@@ -1,6 +1,6 @@
 use crate::network::server::Server;
 use crate::utils::db::{
-    get_vendo_auth_verifier, list_vendos, register_vendo, revoke_vendo_credential,
+    delete_vendo, get_vendo_auth_verifier, list_vendos, register_vendo, revoke_vendo_credential,
     rotate_vendo_credential, set_vendo_enabled,
 };
 use serde::{Deserialize, Serialize};
@@ -114,6 +114,24 @@ pub fn handle_vendos(server: &mut Server) {
         }
 
         json_response(res, 200, serde_json::json!({"ok": true, "vendos": output}));
+    });
+
+    // Permanently remove a vendo registration. Historical payment records are retained.
+    server.delete("/api/admin/vendos", |req, res| {
+        let Some(payload) = parse_payload::<VendoIdPayload>(req, res) else {
+            return;
+        };
+
+        match delete_vendo(&payload.vendo_id) {
+            Ok(()) => {
+                crate::routes::ws::state::invalidate_vendo_connection(&payload.vendo_id);
+                json_response(res, 200, serde_json::json!({"ok": true, "vendo_id": payload.vendo_id}));
+            }
+            Err(error) => {
+                let status = if error == "Vendo not found" { 404 } else { 500 };
+                json_response(res, status, serde_json::json!({"ok": false, "error": error}));
+            }
+        }
     });
 
     // Register a device. The raw credential is returned only in this response.

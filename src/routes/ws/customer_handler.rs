@@ -191,10 +191,23 @@ async fn handle_customer_socket(mut socket: WebSocket) {
         }
     }
 
+    // Register the browser notification channel before restoring or creating
+    // a reservation. A payment can arrive immediately after reservation, and
+    // its notification must already have a live destination.
+    let (customer_tx, mut customer_rx) = tokio::sync::mpsc::unbounded_channel();
+    let connection_id = crate::routes::ws::state::register_customer_connection(
+        &session_id,
+        customer_tx,
+    );
+
     if send_json(&mut socket, json!({
         "type": "CUSTOMER_AUTH_OK",
         "status": "ok",
     })).await.is_err() {
+        crate::routes::ws::state::unregister_customer_connection(
+            &session_id,
+            connection_id,
+        );
         return;
     }
 
@@ -207,17 +220,21 @@ async fn handle_customer_socket(mut socket: WebSocket) {
             // One eligible vendo is reserved automatically. Multiple eligible
             // vendos are offered for explicit selection. An empty list stays silent.
             if send_vendo_options(&mut socket, &session_id).await.is_err() {
+                crate::routes::ws::state::unregister_customer_connection(
+                    &session_id,
+                    connection_id,
+                );
                 return;
             }
         }
-        Err(()) => return,
+        Err(()) => {
+            crate::routes::ws::state::unregister_customer_connection(
+                &session_id,
+                connection_id,
+            );
+            return;
+        }
     }
-
-    let (customer_tx, mut customer_rx) = tokio::sync::mpsc::unbounded_channel();
-    let connection_id = crate::routes::ws::state::register_customer_connection(
-        &session_id,
-        customer_tx,
-    );
 
     loop {
         tokio::select! {

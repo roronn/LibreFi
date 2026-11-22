@@ -2,14 +2,14 @@ use crate::network::server::{Response, Server};
 use crate::utils::db::{
     current_timestamp,
     get_db,
-    redeem_voucher_for_session,
+    redeem_voucher_for_customer_session,
     CONFIG_TABLE,
     VOUCHERS_TABLE,
     SESSIONS_TABLE,
     Voucher,
     Session,
+    WIFI_GRACE_SECONDS,
 };
-use crate::utils::get_mac_from_ip::get_mac_from_ip;
 use redb::ReadableDatabase;
 use serde::Deserialize;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -17,6 +17,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[derive(Deserialize)]
 struct RedeemBody {
     code: String,
+    browser_token: Option<String>,
 }
 
 fn json_error(status: u16, message: &str, res: &mut Response) {
@@ -167,7 +168,14 @@ pub fn redeem(server: &mut Server) {
 
             session.settle(current_timestamp());
 
-            Ok(session.expired_at.is_none() && session.remaining_seconds > 0)
+            Ok(
+                session.expired_at.is_none()
+                    && session.remaining_seconds > 0
+                    && !session.wifi_connected
+                    && session.disconnected_at.is_some_and(|disconnected_at| {
+                        current_timestamp().saturating_sub(disconnected_at) >= WIFI_GRACE_SECONDS
+                    })
+            )
         })();
 
         match status {
@@ -193,33 +201,6 @@ pub fn redeem(server: &mut Server) {
             return;
         }
 
-        let Some(mac) = get_mac_from_ip(&req.ip) else {
-            json_error(403, "Device not recognized", res);
-            return;
-        };
-
-        if !is_valid_mac(&mac) {
-            json_error(403, "Device not recognized", res);
-            return;
-        }
-
-        // Allow five failed attempts within a 60-second lockout window.
-        let (fail_count, last_fail_ts) = get_fail_count(&mac);
-        let now = current_timestamp();
-
-        if fail_count >= 5 {
-            if now.saturating_sub(last_fail_ts) < 60 {
-                json_error(
-                    429,
-                    "Too many failed attempts. Try again in 60 seconds.",
-                    res,
-                );
-                return;
-            }
-
-            clear_fail_count(&mac);
-        }
-
         let body_str = match String::from_utf8(req.body.clone()) {
             Ok(value) => value,
             Err(_) => {
@@ -231,27 +212,51 @@ pub fn redeem(server: &mut Server) {
         let body: RedeemBody = match serde_json::from_str(&body_str) {
             Ok(value) => value,
             Err(_) => {
-                json_error(400, "Expected JSON containing a voucher code", res);
+                json_error(400, "Expected JSON containing a voucher code and browser token", res);
                 return;
             }
         };
 
         let code = body.code.trim();
+        let browser_token = body.browser_token.as_deref().unwrap_or("").trim();
 
         if code.is_empty() || code.len() > 64 {
             json_error(400, "Invalid voucher code", res);
             return;
         }
 
-        match redeem_voucher_for_session(code, &mac) {
-            Ok((session_id, session, credited, browser_token)) => {
-                clear_fail_count(&mac);
+        if browser_token.len() != 64
+            || !browser_token.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            json_error(401, "Your customer session could not be verified. Refresh the page and try again.", res);
+            return;
+        }
 
+        // Rate-limit by client IP only; MAC is not used as customer identity.
+        let client_key = req.ip.clone();
+        let (fail_count, last_fail_ts) = get_fail_count(&client_key);
+        let now = current_timestamp();
+
+        if fail_count >= 5 {
+            if now.saturating_sub(last_fail_ts) < 60 {
+                json_error(
+                    429,
+                    "Too many failed attempts. Try again in 60 seconds.",
+                    res,
+                );
+                return;
+            }
+            clear_fail_count(&client_key);
+        }
+
+        match redeem_voucher_for_customer_session(code, browser_token) {
+            Ok((session_id, session, credited, new_browser_token)) => {
+                clear_fail_count(&client_key);
                 let now = current_timestamp();
 
                 crate::debug_println!(
-                    "Voucher operation completed for MAC={}, credited={}",
-                    mac,
+                    "Voucher operation completed for customer session {}, credited={}",
+                    session_id,
                     credited
                 );
 
@@ -259,10 +264,9 @@ pub fn redeem(server: &mut Server) {
                 res.body = serde_json::json!({
                     "ok": true,
                     "session_id": session_id,
-                    "browser_token": browser_token,
+                    "browser_token": new_browser_token,
                     "name": session.name,
                     "ip": req.ip,
-                    "mac": mac,
                     "paused": session.paused,
                     "pause_attempts": session.pause_attempts,
                     "pause_day": session.pause_day,
@@ -274,18 +278,18 @@ pub fn redeem(server: &mut Server) {
                 })
                 .to_string()
                 .into_bytes();
-
                 res.content_type = "application/json".to_string();
             }
-
             Err(error) => {
                 if error == "Voucher not found" {
-                    set_fail_count(&mac, fail_count.saturating_add(1));
-                    json_error(404, "Your previous voucher could not be recovered. Your session has expired. Please purchase a new voucher or insert coins.", res);
-                } else if error == "This device is already linked to another session" {
+                    set_fail_count(&client_key, fail_count.saturating_add(1));
+                    json_error(404, "Voucher not found", res);
+                } else if error.contains("seven-minute disconnect grace period")
+                    || error == "Voucher recovery is not yet eligible"
+                {
                     json_error(
                         409,
-                        "This device is linked to a different session",
+                        "This voucher can recover your session after the seven-minute disconnect grace period.",
                         res,
                     );
                 } else if error == "Voucher session expired"
@@ -296,13 +300,18 @@ pub fn redeem(server: &mut Server) {
                         "Your previous voucher could not be recovered. Your session has expired. Please purchase a new voucher or insert coins.",
                         res,
                     );
-                } else if error == "No session found for this device" {
-                    json_error(409, "Your previous voucher could not be recovered. Your session has expired. Please purchase a new voucher or insert coins.", res);
+                } else if error == "Browser token is not recognized"
+                    || error == "A valid browser token is required"
+                {
+                    json_error(401, "Your customer session could not be verified. Refresh the page and try again.", res);
+                } else if error == "Voucher belongs to a different customer" {
+                    json_error(403, "This voucher belongs to a different customer.", res);
                 } else {
                     crate::debug_println!("Voucher operation failed: {}", error);
-                    json_error(500, "Could not process voucher", res);
+                    json_error(409, "Could not recover or redeem this voucher for the current session.", res);
                 }
             }
         }
     });
+}
 }

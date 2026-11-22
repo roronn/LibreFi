@@ -1498,11 +1498,34 @@ fn credit_session_for_payment_in_transaction(
         (session_id.to_string(), session, None)
     };
 
-    // Every customer who pays by coin receives one persistent recovery voucher
-    // per active session. The code is a bearer recovery credential, so it uses
-    // 80 bits of cryptographically secure randomness rather than the shorter
-    // six-character codes used for ordinary printed vouchers.
-    if result_session.recovery_voucher_code.is_none() {
+    // Coin payments must use the coin-generated recovery voucher. If the
+    // session currently points to a redeemed retail voucher, issue a coin
+    // recovery voucher and make it current. Existing coin recovery vouchers
+    // are reused on later coin payments.
+    let has_current_coin_recovery = match result_session.recovery_voucher_code.as_deref() {
+        Some(code) => {
+            let vouchers = write_txn
+                .open_table(VOUCHERS_TABLE)
+                .map_err(|e| e.to_string())?;
+            match vouchers.get(code).map_err(|e| e.to_string())? {
+                Some(value) => {
+                    let voucher: Voucher =
+                        serde_json::from_str(value.value()).map_err(|e| e.to_string())?;
+                    voucher.used
+                        && voucher.price == 0.0
+                        && voucher.time == 0
+                        && voucher.customer_id == result_session.customer_id
+                        && voucher.session_id.as_deref() == Some(result_id.as_str())
+                }
+                None => false,
+            }
+        }
+        None => false,
+    };
+
+    // The code is a bearer recovery credential, so it uses 80 bits of
+    // cryptographically secure randomness rather than ordinary voucher codes.
+    if !has_current_coin_recovery {
         let customer_id = result_session
             .customer_id
             .clone()

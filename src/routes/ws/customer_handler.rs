@@ -336,7 +336,7 @@ async fn handle_customer_socket(mut socket: WebSocket) {
 
 #[cfg(test)]
 mod tests {
-    use super::{plan_vendo_discovery, valid_browser_token, VendoDiscoveryPlan};
+    use super::{existing_vendo_assignment, plan_vendo_discovery, valid_browser_token, VendoDiscoveryPlan};
     use crate::utils::db::Vendo;
 
     fn test_vendo(id: &str) -> Vendo {

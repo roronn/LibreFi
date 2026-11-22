@@ -2051,6 +2051,10 @@ pub fn redeem_voucher_for_customer_session(
                 .map_err(|error| error.to_string())?;
         }
 
+        // Keep the credential used for this recovery as the session's
+        // displayed recovery voucher, including for sessions created before
+        // the persistent field was introduced.
+        session.recovery_voucher_code = Some(code.to_string());
         let session_json = serde_json::to_string(&session).map_err(|error| error.to_string())?;
         {
             let mut sessions = write_txn
@@ -2100,7 +2104,7 @@ pub fn redeem_voucher_for_customer_session(
     session.settle(now);
     ensure_customer_for_session(&write_txn, &session_id, &mut session, now)?;
 
-    let (credited_session_id, credited_session, new_browser_token) =
+    let (credited_session_id, mut credited_session, new_browser_token) =
         if session.expired_at.is_some() {
             let new_session_id = generate_secure_id()?;
             let new_browser_token = generate_browser_token()?;
@@ -2206,6 +2210,20 @@ pub fn redeem_voucher_for_customer_session(
 
             (session_id.clone(), session, None)
         };
+
+    // The redeemed voucher itself is the customer's recovery credential.
+    // This also prevents a later coin payment from generating a second code.
+    credited_session.recovery_voucher_code = Some(code.to_string());
+    let credited_session_json =
+        serde_json::to_string(&credited_session).map_err(|error| error.to_string())?;
+    {
+        let mut sessions = write_txn
+            .open_table(SESSIONS_TABLE)
+            .map_err(|error| error.to_string())?;
+        sessions
+            .insert(credited_session_id.as_str(), credited_session_json.as_str())
+            .map_err(|error| error.to_string())?;
+    }
 
     voucher.used = true;
     voucher.customer_id = credited_session.customer_id.clone();

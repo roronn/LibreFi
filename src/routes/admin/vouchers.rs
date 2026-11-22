@@ -229,6 +229,7 @@ pub fn handle_vouchers(server: &mut Server) {
                     created_at: Some(created_at),
                     session_id: None,
                     redeemed_at: None,
+                    customer_id: None,
                 };
 
                 let json_value = match serde_json::to_string(&voucher) {

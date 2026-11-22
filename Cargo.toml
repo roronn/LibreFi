@@ -15,6 +15,7 @@ rust-embed = { version = "8.12.0" }
 rand = "0.8"
 sha2 = "0.11"
 hmac = "0.13"
+ed25519-dalek = "3.0.0"
 axum = { version = "0.8.9", features = ["ws"] }
 tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "net", "time", "sync"] }
 

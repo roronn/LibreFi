@@ -36,6 +36,7 @@ function Coin({ children, onClose }: { children: ReactElement, onClose?: () => v
     const [isSelectingVendo, setIsSelectingVendo] = useState(false);
     const [assignedVendoName, setAssignedVendoName] = useState("");
     const [isSimulatingCoin, setIsSimulatingCoin] = useState(false);
+    const [isAwaitingReservation, setIsAwaitingReservation] = useState(false);
     const isDemoMode = new URLSearchParams(window.location.search).get("demo") === "1";
     const wsRef = useRef<WebSocket | null>(null);
     const pingRef = useRef<number | null>(null);
@@ -64,6 +65,7 @@ function Coin({ children, onClose }: { children: ReactElement, onClose?: () => v
         setIsSelectingVendo(false);
         setAssignedVendoName("");
         setIsSimulatingCoin(false);
+        setIsAwaitingReservation(false);
         onClose?.();
     }
 
@@ -173,6 +175,7 @@ function Coin({ children, onClose }: { children: ReactElement, onClose?: () => v
                     clearTimeout(timeoutId);
                     toast.dismiss(loadingToast);
                     setVendoOptions(options);
+                    setIsAwaitingReservation(false);
                     setIsSelectingVendo(false);
                     setIsChoosingVendo(true);
                     setIsOpen(true);
@@ -180,18 +183,21 @@ function Coin({ children, onClose }: { children: ReactElement, onClose?: () => v
                 }
 
                 if (data.type === "VENDO_ASSIGNED") {
-                    if (paymentWindowStarted) return;
-                    paymentWindowStarted = true;
                     clearTimeout(timeoutId);
                     toast.dismiss(loadingToast);
+                    setIsAwaitingReservation(false);
                     setIsChoosingVendo(false);
                     setIsSelectingVendo(false);
                     setVendoOptions([]);
                     if (typeof data.vendo_name === "string") {
                         setAssignedVendoName(data.vendo_name);
                     }
-                    void loadLastVoucher();
                     setIsOpen(true);
+
+                    // Reassignments after payment keep the current timer and heartbeat.
+                    if (paymentWindowStarted) return;
+                    paymentWindowStarted = true;
+                    void loadLastVoucher();
                     setTimeLeft(29);
 
                     if (timerRef.current) clearInterval(timerRef.current);
@@ -217,6 +223,7 @@ function Coin({ children, onClose }: { children: ReactElement, onClose?: () => v
                 }
 
                 if (data.type === "VENDO_ASSIGNMENT_FAILED") {
+                    setIsAwaitingReservation(false);
                     setIsSelectingVendo(false);
                     toast.error("Vendo selection failed", {
                         description: typeof data.reason === "string" ? data.reason : "Please choose an available vendo.",
@@ -365,7 +372,7 @@ function Coin({ children, onClose }: { children: ReactElement, onClose?: () => v
                                     type="button"
                                     variant="outline"
                                     className="w-full"
-                                    disabled={isSimulatingCoin}
+                                    disabled={isSimulatingCoin || isAwaitingReservation}
                                     onClick={async () => {
                                         const browserToken = localStorage.getItem("librefi_browser_token");
                                         if (!browserToken) {
@@ -390,7 +397,11 @@ function Coin({ children, onClose }: { children: ReactElement, onClose?: () => v
                                             toast.success("Demo coin accepted", {
                                                 description: `₱${result.amount} credited to this customer session.`,
                                                 position: "top-center"
-                                            });
+                                            });                                            const customerSocket = wsRef.current;
+                                            if (customerSocket?.readyState === WebSocket.OPEN) {
+                                                setIsAwaitingReservation(true);
+                                                customerSocket.send(JSON.stringify({ type: "REQUEST_VENDO" }));
+                                            }
                                         } catch (error) {
                                             toast.error("Demo payment failed", {
                                                 description: error instanceof Error ? error.message : "Could not simulate the coin",

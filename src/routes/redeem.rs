@@ -159,14 +159,10 @@ pub fn redeem(server: &mut Server) {
 
             session.settle(current_timestamp());
 
-            Ok(
-                session.expired_at.is_none()
-                    && session.remaining_seconds > 0
-                    && !session.wifi_connected
-                    && session.disconnected_at.is_some_and(|disconnected_at| {
-                        current_timestamp().saturating_sub(disconnected_at) >= WIFI_GRACE_SECONDS
-                    })
-            )
+            // "Recoverable" means the credential still points to a live,
+            // unexpired customer session. Actual transfer is permitted only
+            // after the seven-minute disconnect grace period in the redeem flow.
+            Ok(session.expired_at.is_none() && session.remaining_seconds > 0)
         })();
 
         match status {

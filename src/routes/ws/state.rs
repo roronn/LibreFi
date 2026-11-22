@@ -1,4 +1,3 @@
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
@@ -135,7 +134,9 @@ mod vendo_connection_tests {
 
     #[test]
     fn reconnect_replaces_old_generation_safely() {
-        let vendo_id = format!("test-vendo-{}", new_owner_id());
+        static NEXT_TEST_ID: AtomicU64 = AtomicU64::new(1);
+        let test_id = NEXT_TEST_ID.fetch_add(1, Ordering::Relaxed);
+        let vendo_id = format!("test-vendo-{test_id}");
 
         let first = register_vendo_connection(&vendo_id);
         assert!(is_vendo_online(&vendo_id));

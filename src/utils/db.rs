@@ -2019,6 +2019,13 @@ pub fn redeem_voucher_for_customer_session(
             return Err("Voucher belongs to a different customer".to_string());
         }
 
+        // Only the most recently issued/redeemed recovery voucher remains
+        // valid. Older voucher records stay in the database for audit history
+        // but cannot transfer this customer's session.
+        if session.recovery_voucher_code.as_deref() != Some(code) {
+            return Err("Voucher is no longer the current recovery credential".to_string());
+        }
+
         session.settle(now);
         if session.expired_at.is_some() {
             return Err("Voucher session expired".to_string());

@@ -15,26 +15,26 @@ static CUSTOMER_CONNECTIONS: LazyLock<
 pub fn register_customer_connection(
     session_id: &str,
     sender: UnboundedSender<serde_json::Value>,
-) -> u64 {
+) -> (u64, bool) {
     let connection_id = NEXT_CUSTOMER_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
-    CUSTOMER_CONNECTIONS
-        .lock()
-        .unwrap()
-        .entry(session_id.to_string())
-        .or_default()
-        .insert(connection_id, sender);
-    connection_id
+    let mut connections = CUSTOMER_CONNECTIONS.lock().unwrap();
+    let session_connections = connections.entry(session_id.to_string()).or_default();
+    let first_connection = session_connections.is_empty();
+    session_connections.insert(connection_id, sender);
+    (connection_id, first_connection)
 }
 
 /// Removes only the specified browser connection.
-pub fn unregister_customer_connection(session_id: &str, connection_id: u64) {
+pub fn unregister_customer_connection(session_id: &str, connection_id: u64) -> bool {
     let mut connections = CUSTOMER_CONNECTIONS.lock().unwrap();
     if let Some(session_connections) = connections.get_mut(session_id) {
         session_connections.remove(&connection_id);
         if session_connections.is_empty() {
             connections.remove(session_id);
+            return true;
         }
     }
+    false
 }
 
 /// Sends a payment/session event to every connected tab for this session.

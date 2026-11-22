@@ -115,7 +115,8 @@ impl Server {
             println!("Axum server running on port {}", port);
 
             let app = Router::new()
-                .route("/ws", get(crate::routes::ws::axum_handler::axum_ws_handler))
+                .route("/ws", get(crate::routes::ws::customer_handler::customer_ws_handler))
+                .route("/ws/vendo", get(crate::routes::ws::axum_handler::axum_ws_handler))
                 .fallback(any(dispatch))
                 .with_state(routes);
 

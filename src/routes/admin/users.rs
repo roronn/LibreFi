@@ -46,11 +46,11 @@ pub fn handle_users(server: &mut Server) {
                 return;
             }
         };
-        let payload: DeleteUserPayload = match serde_json::from_str(&json) {
+        let payload: DeleteUserPayload = match serde_json::from_str::<DeleteUserPayload>(&json) {
             Ok(payload) if !payload.session_id.trim().is_empty() => payload,
             _ => {
                 res.status = 400;
-                res.body = br#"{"ok":false,"error":"Invalid session_id"}"#.to_vec();
+                res.body = br#"{\"ok\":false,\"error\":\"Invalid session_id\"}"#.to_vec();
                 res.content_type = "application/json".to_string();
                 return;
             }
@@ -59,7 +59,7 @@ pub fn handle_users(server: &mut Server) {
         match crate::utils::db::delete_customer_session(&payload.session_id) {
             Ok(()) => {
                 res.status = 200;
-                res.body = br#"{"ok":true}"#.to_vec();
+                res.body = br#"{\"ok\":true}"#.to_vec();
             }
             Err(error) => {
                 res.status = if error == "Customer session not found" { 404 } else { 500 };

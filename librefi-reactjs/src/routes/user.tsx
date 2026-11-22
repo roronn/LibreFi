@@ -15,18 +15,29 @@ import {
 import { useCallback, useEffect, useState } from "react";
 import type { UserType } from ".././types/user";
 import { toast } from "#components/ui/toast";
+import { authenticateStoredCustomerKey, registerCustomerKey } from "#lib/customerIdentity";
 
 function User() {
     const [user, setUser] = useState<UserType>();
     const [status, setStatus] = useState("--");
 
     const init = useCallback(async () => {
-        const savedToken = localStorage.getItem("librefi_browser_token");
-        const params = new URLSearchParams({ _: String(Date.now()) });
+        let savedToken = localStorage.getItem("librefi_browser_token");
 
-        if (savedToken) {
-            params.set("browser_token", savedToken);
+        // Prefer the device's Ed25519 key. If key storage or signing is
+        // unavailable, retain the existing browser-token fallback.
+        try {
+            const keyToken = await authenticateStoredCustomerKey();
+            if (keyToken) {
+                savedToken = keyToken;
+                localStorage.setItem("librefi_browser_token", keyToken);
+            }
+        } catch {
+            // A valid browser token remains an accepted fallback.
         }
+
+        const params = new URLSearchParams({ _: String(Date.now()) });
+        if (savedToken) params.set("browser_token", savedToken);
 
         const res = await fetch(`/api/init?${params.toString()}`, {
             method: "GET"
@@ -40,6 +51,11 @@ function User() {
                 /^[0-9a-fA-F]{64}$/.test(json.browser_token)
             ) {
                 localStorage.setItem("librefi_browser_token", json.browser_token);
+                try {
+                    await registerCustomerKey(json.browser_token);
+                } catch {
+                    // Token authentication remains available if key enrollment fails.
+                }
             }
 
             setUser(json);
@@ -100,8 +116,11 @@ function User() {
 
     async function handlePlayPause() {
         const playPauseRequest = async () => {
+            const browserToken = localStorage.getItem("librefi_browser_token");
             const res = await fetch("/api/play_pause", {
-                method: "POST"
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ browser_token: browserToken })
             });
 
             if (!res.ok) {

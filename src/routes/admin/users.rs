@@ -15,6 +15,7 @@ struct GetUsersPayload {
 #[derive(Serialize, Clone)]
 struct UserWithMac {
     mac: String,
+    session_id: String,
     name: String,
     ip: String,
     paused: bool,
@@ -32,6 +33,42 @@ struct UsersListResponse {
 }
 
 pub fn handle_users(server: &mut Server) {
+    server.delete("/api/admin/users", |req, res| {
+        #[derive(serde::Deserialize)]
+        struct DeleteUserPayload { session_id: String }
+
+        let json = match parse_admin_payload(req) {
+            Ok(json) => json,
+            Err((status, body)) => {
+                res.status = status;
+                res.body = body;
+                res.content_type = "application/json".to_string();
+                return;
+            }
+        };
+        let payload: DeleteUserPayload = match serde_json::from_str(&json) {
+            Ok(payload) if !payload.session_id.trim().is_empty() => payload,
+            _ => {
+                res.status = 400;
+                res.body = br#"{"ok":false,"error":"Invalid session_id"}"#.to_vec();
+                res.content_type = "application/json".to_string();
+                return;
+            }
+        };
+
+        match crate::utils::db::delete_customer_session(&payload.session_id) {
+            Ok(()) => {
+                res.status = 200;
+                res.body = br#"{"ok":true}"#.to_vec();
+            }
+            Err(error) => {
+                res.status = if error == "Customer session not found" { 404 } else { 500 };
+                res.body = serde_json::json!({"ok":false,"error":error}).to_string().into_bytes();
+            }
+        }
+        res.content_type = "application/json".to_string();
+    });
+
     server.get("/api/admin/users", |req, res| {
         let json = match parse_admin_payload(req) {
             Ok(j) => j,
@@ -67,6 +104,7 @@ pub fn handle_users(server: &mut Server) {
 
                         all_users.push(UserWithMac {
                             mac: mac.value().to_string(),
+                            session_id: session_id.value().to_string(),
                             name: session.name,
                             ip: session.ip,
                             paused: session.paused,

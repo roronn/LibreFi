@@ -40,6 +40,10 @@ fn main() {
         utils::setup_captive_portal::restore_qos_settings();
     }
 
+    if let Err(error) = utils::db::mark_all_customer_sessions_disconnected() {
+        eprintln!("Failed to restore customer disconnect state: {}", error);
+    }
+
     if std::env::var("LIBREFI_DEBUG").unwrap_or_default() == "true" {
         debug(&mut server);
     }

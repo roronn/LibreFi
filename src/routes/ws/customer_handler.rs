@@ -8,7 +8,7 @@ use tokio::time::{timeout, Duration};
 
 use crate::utils::db::{
     find_session_by_browser_token, get_session, list_available_vendos,
-    release_vendo_reservation_for_session, reserve_vendo_for_customer_session,
+    release_vendo_reservation_for_session, reserve_vendo_for_customer_session, Vendo,
 };
 
 const AUTH_TIMEOUT: Duration = Duration::from_secs(10);
@@ -50,18 +50,31 @@ async fn close_socket(socket: &mut WebSocket) {
     let _ = socket.send(Message::Close(None)).await;
 }
 
+enum VendoDiscoveryPlan {
+    NoneAvailable,
+    AutoAssign(Vendo),
+    Choose(Vec<Vendo>),
+}
+
+fn plan_vendo_discovery(mut available: Vec<Vendo>) -> VendoDiscoveryPlan {
+    match available.len() {
+        0 => VendoDiscoveryPlan::NoneAvailable,
+        1 => VendoDiscoveryPlan::AutoAssign(available.remove(0)),
+        _ => VendoDiscoveryPlan::Choose(available),
+    }
+}
+
 async fn send_vendo_options(socket: &mut WebSocket, session_id: &str) -> Result<(), ()> {
     let available = list_available_vendos().map_err(|error| {
         eprintln!("Failed to list available vendos: {}", error);
     }).map_err(|_| ())?;
 
-    match available.len() {
-        0 => send_json(socket, json!({
+    match plan_vendo_discovery(available) {
+        VendoDiscoveryPlan::NoneAvailable => send_json(socket, json!({
             "type": "VENDO_OPTIONS",
             "available": [],
         })).await,
-        1 => {
-            let vendo = &available[0];
+        VendoDiscoveryPlan::AutoAssign(vendo) => {
             match reserve_vendo_for_customer_session(&vendo.vendo_id, session_id) {
                 Ok(reservation) => send_json(socket, json!({
                     "type": "VENDO_ASSIGNED",
@@ -74,7 +87,7 @@ async fn send_vendo_options(socket: &mut WebSocket, session_id: &str) -> Result<
                 })).await,
             }
         }
-        _ => {
+        VendoDiscoveryPlan::Choose(available) => {
             let choices: Vec<Value> = available.iter().map(|vendo| json!({
                 "vendo_id": vendo.vendo_id,
                 "name": vendo.name,
@@ -278,12 +291,56 @@ async fn handle_customer_socket(mut socket: WebSocket) {
 
 #[cfg(test)]
 mod tests {
-    use super::valid_browser_token;
+    use super::{plan_vendo_discovery, valid_browser_token, VendoDiscoveryPlan};
+    use crate::utils::db::Vendo;
+
+    fn test_vendo(id: &str) -> Vendo {
+        Vendo {
+            vendo_id: id.to_string(),
+            name: format!("Vendo {id}"),
+            enabled: true,
+            created_at: 1,
+        }
+    }
 
     #[test]
     fn browser_token_validation_requires_64_hex_characters() {
         assert!(valid_browser_token(&"a".repeat(64)));
         assert!(!valid_browser_token(&"a".repeat(63)));
         assert!(!valid_browser_token(&format!("{}z", "a".repeat(63))));
+    }
+
+    #[test]
+    fn customer_vendo_discovery_silently_handles_no_available_vendos() {
+        assert!(matches!(
+            plan_vendo_discovery(Vec::new()),
+            VendoDiscoveryPlan::NoneAvailable
+        ));
+    }
+
+    #[test]
+    fn customer_vendo_discovery_auto_assigns_the_only_available_vendo() {
+        match plan_vendo_discovery(vec![test_vendo("vendo-one")]) {
+            VendoDiscoveryPlan::AutoAssign(vendo) => {
+                assert_eq!(vendo.vendo_id, "vendo-one");
+                assert_eq!(vendo.name, "Vendo vendo-one");
+            }
+            _ => panic!("One available vendo must be auto-assigned"),
+        }
+    }
+
+    #[test]
+    fn customer_vendo_discovery_offers_a_choice_when_multiple_are_available() {
+        match plan_vendo_discovery(vec![
+            test_vendo("vendo-one"),
+            test_vendo("vendo-two"),
+        ]) {
+            VendoDiscoveryPlan::Choose(vendos) => {
+                assert_eq!(vendos.len(), 2);
+                assert_eq!(vendos[0].vendo_id, "vendo-one");
+                assert_eq!(vendos[1].vendo_id, "vendo-two");
+            }
+            _ => panic!("Multiple available vendos must be offered for selection"),
+        }
     }
 }

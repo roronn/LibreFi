@@ -261,6 +261,19 @@ async fn handle_customer_socket(mut socket: WebSocket) {
                             break;
                         }
                     }
+                    // A successful payment releases its reservation. Let the same
+                    // authenticated browser request another reservation.
+                    Ok(message) if message.msg_type == "REQUEST_VENDO" => {
+                        match restore_existing_vendo_reservation(&mut socket, &session_id).await {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                if send_vendo_options(&mut socket, &session_id).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(()) => break,
+                        }
+                    }
                     Ok(message) if message.msg_type == "SELECT_VENDO" => {
                         let vendo_id = match message.vendo_id {
                             Some(id) if !id.trim().is_empty()

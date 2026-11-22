@@ -2,6 +2,7 @@ import { Link, useLocation } from "wouter";
 import {
     HomeIcon,
     MonitorSmartphone,
+    Cpu,
     PhilippinePeso,
     Cog,
     User,
@@ -25,6 +26,7 @@ function AdminLayout({ children }: { children: React.ReactNode }) {
     const navItems = [
         { path: "/dashboard", icon: HomeIcon, label: "Home" },
         { path: "/users", icon: MonitorSmartphone, label: "Users" },
+        { path: "/vendos", icon: Cpu, label: "Vendos" },
         { path: "/vouch_rates", icon: PhilippinePeso, label: "Vouch & Rates" },
         { path: "/settings", icon: Cog, label: "Settings" }
     ];
@@ -32,6 +34,7 @@ function AdminLayout({ children }: { children: React.ReactNode }) {
     const headText: Record<string, string[]> = {
         "/dashboard": ["Dashboard", "View analytics and monitor system status."],
         "/users": ["Users", "Manage and monitor user accounts and information."],
+        "/vendos": ["Vendos", "Register, monitor, enable, and manage individual coin vendos."],
         "/vouch_rates": ["Vouchers & Rates", "Create and manage access vouchers, rates, and pricing options."],
         "/settings": ["Settings", "Manage system configurations, WiFi access points, and quality of service."],
     }

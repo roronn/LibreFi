@@ -9,7 +9,8 @@ use tokio::time::{timeout, Duration};
 use crate::utils::db::{
     find_session_by_browser_token, get_session, get_vendo,
     get_vendo_reservation_for_session, list_available_vendos,
-    release_vendo_reservation_for_session, reserve_vendo_for_customer_session, Vendo,
+    release_vendo_reservation_for_session, reserve_vendo_for_customer_session,
+    set_session_wifi_connected, Vendo,
 };
 
 const AUTH_TIMEOUT: Duration = Duration::from_secs(10);
@@ -21,6 +22,15 @@ struct CustomerMessage {
     msg_type: String,
     value: Option<Value>,
     vendo_id: Option<String>,
+}
+
+
+fn unregister_customer_and_update_connectivity(session_id: &str, connection_id: u64) {
+    if crate::routes::ws::state::unregister_customer_connection(session_id, connection_id) {
+        if let Err(error) = set_session_wifi_connected(session_id, false) {
+            eprintln!("Failed to persist customer disconnect state: {}", error);
+        }
+    }
 }
 
 fn valid_browser_token(token: &str) -> bool {
@@ -195,19 +205,19 @@ async fn handle_customer_socket(mut socket: WebSocket) {
     // a reservation. A payment can arrive immediately after reservation, and
     // its notification must already have a live destination.
     let (customer_tx, mut customer_rx) = tokio::sync::mpsc::unbounded_channel();
-    let connection_id = crate::routes::ws::state::register_customer_connection(
-        &session_id,
-        customer_tx,
-    );
+    let (connection_id, first_connection) =
+        crate::routes::ws::state::register_customer_connection(&session_id, customer_tx);
+    if first_connection {
+        if let Err(error) = set_session_wifi_connected(&session_id, true) {
+            eprintln!("Failed to persist customer connect state: {}", error);
+        }
+    }
 
     if send_json(&mut socket, json!({
         "type": "CUSTOMER_AUTH_OK",
         "status": "ok",
     })).await.is_err() {
-        crate::routes::ws::state::unregister_customer_connection(
-            &session_id,
-            connection_id,
-        );
+        unregister_customer_and_update_connectivity(&session_id, connection_id);
         return;
     }
 
@@ -220,18 +230,12 @@ async fn handle_customer_socket(mut socket: WebSocket) {
             // One eligible vendo is reserved automatically. Multiple eligible
             // vendos are offered for explicit selection. An empty list stays silent.
             if send_vendo_options(&mut socket, &session_id).await.is_err() {
-                crate::routes::ws::state::unregister_customer_connection(
-                    &session_id,
-                    connection_id,
-                );
+                unregister_customer_and_update_connectivity(&session_id, connection_id);
                 return;
             }
         }
         Err(()) => {
-            crate::routes::ws::state::unregister_customer_connection(
-                &session_id,
-                connection_id,
-            );
+            unregister_customer_and_update_connectivity(&session_id, connection_id);
             return;
         }
     }
@@ -345,10 +349,7 @@ async fn handle_customer_socket(mut socket: WebSocket) {
         }
     }
 
-    crate::routes::ws::state::unregister_customer_connection(
-        &session_id,
-        connection_id,
-    );
+    unregister_customer_and_update_connectivity(&session_id, connection_id);
 }
 
 #[cfg(test)]

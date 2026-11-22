@@ -225,13 +225,6 @@ pub fn redeem(server: &mut Server) {
             return;
         }
 
-        if browser_token.len() != 64
-            || !browser_token.bytes().all(|byte| byte.is_ascii_hexdigit())
-        {
-            json_error(401, "Your customer session could not be verified. Refresh the page and try again.", res);
-            return;
-        }
-
         // Rate-limit by client IP only; MAC is not used as customer identity.
         let client_key = req.ip.clone();
         let (fail_count, last_fail_ts) = get_fail_count(&client_key);
@@ -249,7 +242,7 @@ pub fn redeem(server: &mut Server) {
             clear_fail_count(&client_key);
         }
 
-        match redeem_voucher_for_customer_session(code, browser_token) {
+        match redeem_voucher_for_customer_session(code, body.browser_token.as_deref()) {
             Ok((session_id, session, credited, new_browser_token)) => {
                 clear_fail_count(&client_key);
                 let now = current_timestamp();

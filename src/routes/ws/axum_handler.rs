@@ -463,7 +463,6 @@ mod auth_smoke_tests {
             create_session, get_db, get_session, init_test_db_once, register_vendo,
             reserve_vendo_for_customer_session, Session, RATES_TABLE,
         };
-        use redb::TableDefinition;
         use redb::WritableTable;
         use std::sync::{Arc, Barrier};
         use tungstenite::{connect, Message};

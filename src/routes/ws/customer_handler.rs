@@ -256,6 +256,7 @@ async fn handle_customer_socket(mut socket: WebSocket) {
                 close_socket(&mut socket).await;
                 break;
             },
+            },
             notification = customer_rx.recv() => {
                 match notification {
                     Some(value) => {

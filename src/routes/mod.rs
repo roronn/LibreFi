@@ -1,6 +1,8 @@
 pub mod admin;
 pub mod coin;
 pub mod customer_identity;
+#[cfg(windows)]
+pub mod demo;
 pub mod debug;
 pub mod index;
 pub mod init;

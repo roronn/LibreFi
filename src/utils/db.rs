@@ -2417,9 +2417,8 @@ mod session_logic_tests {
         };
 
         assert!(matches!(
-            credit_vendo_payment(
+            credit_vendo_payment_for_session(
                 "test-second-vendo-session",
-                "test-second-vendo-mac",
                 10,
                 second_vendo_event_one,
             )
@@ -2447,9 +2446,8 @@ mod session_logic_tests {
         };
 
         assert!(
-            credit_vendo_payment(
+            credit_vendo_payment_for_session(
                 "missing-session",
-                "missing-mac",
                 15,
                 second_vendo_event_two.clone(),
             )
@@ -2458,9 +2456,8 @@ mod session_logic_tests {
 
         // The same event can succeed after the session mapping is corrected.
         assert!(matches!(
-            credit_vendo_payment(
+            credit_vendo_payment_for_session(
                 "test-second-vendo-session",
-                "test-second-vendo-mac",
                 15,
                 second_vendo_event_two,
             )

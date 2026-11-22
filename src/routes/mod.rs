@@ -1,5 +1,6 @@
 pub mod admin;
 pub mod coin;
+pub mod customer_identity;
 pub mod debug;
 pub mod index;
 pub mod init;

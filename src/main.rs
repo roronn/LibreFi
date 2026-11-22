@@ -51,6 +51,9 @@ fn main() {
     index(&mut server);
 
     #[cfg(windows)]
+    routes::demo::demo(&mut server);
+
+    #[cfg(windows)]
     server.post("/test/add-time", |_, res| {
         use crate::utils::db::{get_db, USERS_TABLE};
         use redb::ReadableTable;

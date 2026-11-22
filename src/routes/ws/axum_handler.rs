@@ -633,6 +633,243 @@ mod auth_smoke_tests {
         worker_result.expect("Concurrent WebSocket payment test task should complete");
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn stress_test_100_customers_with_ten_live_vendo_payments() {
+        use crate::routes::ws::customer_handler::customer_ws_handler;
+        use crate::utils::crypto::{
+            decrypt_payload, derive_vendo_session_key, encrypt_payload, vendo_auth_proof,
+        };
+        use crate::utils::db::{
+            create_session, generate_browser_token, generate_secure_id, get_db, get_session,
+            init_test_db_once, register_vendo, reserve_vendo_for_customer_session, Session,
+            RATES_TABLE,
+        };
+        use std::thread;
+
+        const CUSTOMER_COUNT: usize = 100;
+        const VENDO_COUNT: usize = 10;
+        init_test_db_once();
+
+        let test_id = generate_secure_id().unwrap();
+        let rate_key = u32::from_str_radix(&test_id[..8], 16).unwrap();
+        let rate_value = serde_json::json!({ "price": 10.0, "time": 60 }).to_string();
+        {
+            let db = get_db();
+            let write_txn = db.begin_write().unwrap();
+            {
+                let mut rates = write_txn.open_table(RATES_TABLE).unwrap();
+                rates.insert(rate_key, rate_value.as_str()).unwrap();
+            }
+            write_txn.commit().unwrap();
+        }
+
+        let mut customers = Vec::with_capacity(CUSTOMER_COUNT);
+        for index in 0..CUSTOMER_COUNT {
+            let session_id = format!("combined-load-session-{test_id}-{index}");
+            let token = generate_browser_token().unwrap();
+            let mac = format!("02:30:00:{:02x}:{:02x}:{:02x}", index / 256, index % 256, index + 1);
+            let mut session = Session::new(
+                format!("Combined Load Customer {index}"),
+                "127.0.0.1".to_string(),
+                crate::utils::db::current_timestamp(),
+            );
+            session.remaining_seconds = 100;
+            session.paused = true;
+            create_session(&session_id, &session, &mac, &token).unwrap();
+            customers.push((session_id, token));
+        }
+
+        let mut vendos = Vec::with_capacity(VENDO_COUNT);
+        for index in 0..VENDO_COUNT {
+            let (vendo, _credential) =
+                register_vendo(&format!("Combined Load Vendo {test_id}-{index}")).unwrap();
+            let verifier = crate::utils::db::get_vendo_auth_verifier(&vendo.vendo_id)
+                .unwrap()
+                .expect("Registered vendo must have a verifier");
+            vendos.push((vendo, verifier));
+        }
+
+        let app = Router::new()
+            .route("/ws/vendo", get(super::axum_ws_handler))
+            .route("/ws/customer", get(customer_ws_handler));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+        let url = format!("ws://{address}");
+
+        let worker_result = tokio::task::spawn_blocking(move || {
+            // Authenticate and hold all ten vendo WebSockets open.
+            let mut vendo_clients = Vec::with_capacity(VENDO_COUNT);
+            for (index, (vendo, verifier)) in vendos.iter().enumerate() {
+                let (mut client, _) = connect(format!("{url}/ws/vendo")).unwrap();
+                client.send(Message::Text(serde_json::json!({
+                    "type": "HELLO",
+                    "vendo_id": vendo.vendo_id,
+                }).to_string().into())).unwrap();
+
+                let challenge_text = match client.read().unwrap() {
+                    Message::Text(text) => text.to_string(),
+                    other => panic!("Vendo {index}: expected CHALLENGE, got {other:?}"),
+                };
+                let challenge_json: serde_json::Value =
+                    serde_json::from_str(&challenge_text).unwrap();
+                assert_eq!(challenge_json["type"], "CHALLENGE");
+                let challenge_bytes = STANDARD
+                    .decode(challenge_json["challenge"].as_str().unwrap())
+                    .unwrap();
+                let challenge: [u8; 32] = challenge_bytes.try_into().unwrap();
+                let proof = vendo_auth_proof(verifier, &vendo.vendo_id, &challenge).unwrap();
+
+                client.send(Message::Text(serde_json::json!({
+                    "type": "AUTH",
+                    "proof": STANDARD.encode(proof),
+                }).to_string().into())).unwrap();
+
+                let auth_text = match client.read().unwrap() {
+                    Message::Text(text) => text.to_string(),
+                    other => panic!("Vendo {index}: expected AUTH_OK, got {other:?}"),
+                };
+                let auth_json: serde_json::Value =
+                    serde_json::from_str(&auth_text).unwrap();
+                assert_eq!(auth_json["type"], "AUTH_OK");
+
+                let session_key =
+                    derive_vendo_session_key(verifier, &vendo.vendo_id, &challenge).unwrap();
+                vendo_clients.push((client, vendo.vendo_id.clone(), session_key, index));
+            }
+
+            // Open and authenticate 100 customer WebSockets, keeping every
+            // connection alive while the ten vendo payments are processed.
+            let mut customer_clients = Vec::with_capacity(CUSTOMER_COUNT);
+            let mut customer_session_ids = Vec::with_capacity(CUSTOMER_COUNT);
+            for (index, (session_id, token)) in customers.iter().enumerate() {
+                let (mut client, _) = connect(format!("{url}/ws/customer")).unwrap();
+                client.send(Message::Text(serde_json::json!({
+                    "type": "ACK",
+                    "value": token,
+                }).to_string().into())).unwrap();
+
+                let auth_text = match client.read().unwrap() {
+                    Message::Text(text) => text.to_string(),
+                    other => panic!("Customer {index}: expected CUSTOMER_AUTH_OK, got {other:?}"),
+                };
+                let auth_json: serde_json::Value =
+                    serde_json::from_str(&auth_text).unwrap();
+                assert_eq!(auth_json["type"], "CUSTOMER_AUTH_OK");
+
+                let options_text = match client.read().unwrap() {
+                    Message::Text(text) => text.to_string(),
+                    other => panic!("Customer {index}: expected VENDO_OPTIONS, got {other:?}"),
+                };
+                let options_json: serde_json::Value =
+                    serde_json::from_str(&options_text).unwrap();
+                assert_eq!(options_json["type"], "VENDO_OPTIONS");
+                assert!(options_json["available"].as_array().unwrap().len() >= VENDO_COUNT);
+
+                customer_clients.push(client);
+                customer_session_ids.push(session_id.clone());
+            }
+
+            // Reserve ten distinct customer sessions, one per authenticated vendo.
+            for index in 0..VENDO_COUNT {
+                reserve_vendo_for_customer_session(
+                    &vendo_clients[index].1,
+                    &customer_session_ids[index],
+                ).expect("Each online vendo should reserve its assigned customer session");
+            }
+
+            // Send ten encrypted payment events concurrently over the live sockets.
+            let mut payment_workers = Vec::with_capacity(VENDO_COUNT);
+            for (mut client, vendo_id, session_key, index) in vendo_clients {
+                let session_id = customer_session_ids[index].clone();
+                let event_id = format!("combined-load-payment-{test_id}-{index}");
+                payment_workers.push(thread::spawn(move || {
+                    let plaintext = serde_json::json!({
+                        "type": "PAYMENT",
+                        "event_id": event_id,
+                        "sequence": 1,
+                        "amount": 10,
+                        "pulse_count": 1,
+                        "device_timestamp": 1,
+                    }).to_string();
+                    let encrypted = encrypt_payload(&plaintext, &session_key).unwrap();
+                    let envelope = serde_json::json!({
+                        "type": "ENCRYPTED",
+                        "payload": STANDARD.encode(encrypted),
+                    });
+                    client.send(Message::Text(envelope.to_string().into())).unwrap();
+
+                    let response_text = match client.read().unwrap() {
+                        Message::Text(text) => text.to_string(),
+                        other => panic!("Vendo {index} ({vendo_id}): expected encrypted result, got {other:?}"),
+                    };
+                    let response: serde_json::Value =
+                        serde_json::from_str(&response_text).unwrap();
+                    assert_eq!(response["type"], "ENCRYPTED");
+                    let response_bytes = STANDARD
+                        .decode(response["payload"].as_str().unwrap())
+                        .unwrap();
+                    let response_plaintext =
+                        decrypt_payload(&response_bytes, &session_key).unwrap();
+                    let result: serde_json::Value =
+                        serde_json::from_str(&response_plaintext).unwrap();
+                    assert_eq!(result["type"], "PAYMENT_ACCEPTED");
+                    assert_eq!(result["credited_seconds"], 60);
+                    let session = get_session(&session_id)
+                        .unwrap()
+                        .expect("Paid customer session must remain available");
+                    assert_eq!(session.remaining_seconds, 160);
+                }));
+            }
+            for worker in payment_workers {
+                worker.join().expect("Concurrent payment worker must not panic");
+            }
+
+            // Confirm every customer socket is still responsive. The ten paid
+            // sessions must also receive their coin notification while all
+            // ninety other customer connections remain connected.
+            for (index, client) in customer_clients.iter_mut().enumerate() {
+                client.send(Message::Text(
+                    serde_json::json!({ "type": "ping" }).to_string().into()
+                )).unwrap();
+
+                let mut saw_coin_notification = false;
+                let mut saw_pong = false;
+                for _ in 0..3 {
+                    let message = client.read().unwrap();
+                    if let Message::Text(text) = message {
+                        let value: serde_json::Value =
+                            serde_json::from_str(text.as_ref()).unwrap();
+                        if value["type"] == "coin" {
+                            saw_coin_notification = true;
+                        } else if value["type"] == "pong" {
+                            saw_pong = true;
+                            break;
+                        }
+                    }
+                }
+                assert!(saw_pong, "Customer {index} WebSocket stopped responding under combined load");
+                if index < VENDO_COUNT {
+                    assert!(saw_coin_notification, "Paid customer {index} did not receive its coin notification");
+                }
+            }
+
+            for client in customer_clients {
+                let _ = client.close(None);
+            }
+        }).await;
+
+        server_task.abort();
+        worker_result.expect("Combined 100-customer/10-vendo load test task must complete");
+    }
+
     #[tokio::test]
     async fn websocket_authentication_smoke_test() {
         use crate::utils::db::{get_vendo_auth_verifier, init_test_db_once, register_vendo};

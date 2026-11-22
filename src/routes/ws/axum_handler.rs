@@ -280,7 +280,7 @@ async fn handle_socket(mut socket: WebSocket, ip: String) {
                     break;
                 }
 
-                let envelope: EncryptedEnvelope = match serde_json::from_str(&text) {
+                let envelope: EncryptedEnvelope = match serde_json::from_str::<EncryptedEnvelope>(&text) {
                     Ok(message) if message.msg_type == "ENCRYPTED" => message,
                     _ => {
                         reject_connection(&mut socket).await;

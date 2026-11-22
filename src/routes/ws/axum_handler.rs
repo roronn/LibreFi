@@ -682,7 +682,7 @@ mod auth_smoke_tests {
         let mut vendos = Vec::with_capacity(VENDO_COUNT);
         for index in 0..VENDO_COUNT {
             let (vendo, _credential) =
-                register_vendo(&format!("Combined Load Vendo {test_id}-{index}")).unwrap();
+                register_vendo(&format!("Load-{index}-{}", &test_id[..8])).unwrap();
             let verifier = crate::utils::db::get_vendo_auth_verifier(&vendo.vendo_id)
                 .unwrap()
                 .expect("Registered vendo must have a verifier");

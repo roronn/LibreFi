@@ -3,6 +3,27 @@ use aes_gcm::{
     Aes256Gcm, Key, Nonce,
 };
 
+/// Encrypts UTF-8 plaintext as [12-byte nonce + AES-256-GCM ciphertext].
+pub fn encrypt_payload(plaintext: &str, secret_key: &[u8; 32]) -> Result<Vec<u8>, String> {
+    let key = Key::<Aes256Gcm>::from_slice(secret_key);
+    let cipher = Aes256Gcm::new(key);
+
+    let mut nonce_bytes = [0u8; 12];
+    rand::rngs::OsRng
+        .try_fill_bytes(&mut nonce_bytes)
+        .map_err(|e| format!("Secure nonce generation failed: {}", e))?;
+
+    let nonce = Nonce::from_slice(&nonce_bytes);
+    let ciphertext = cipher
+        .encrypt(nonce, plaintext.as_bytes())
+        .map_err(|_| "Payload encryption failed".to_string())?;
+
+    let mut output = Vec::with_capacity(nonce_bytes.len() + ciphertext.len());
+    output.extend_from_slice(&nonce_bytes);
+    output.extend_from_slice(&ciphertext);
+    Ok(output)
+}
+
 /// Decrypts a byte vector containing [Nonce + Ciphertext] back into a String
 pub fn decrypt_payload(encrypted_data: &[u8], secret_key: &[u8; 32]) -> Result<String, String> {
     if encrypted_data.len() < 12 {
@@ -116,6 +137,20 @@ pub fn derive_vendo_session_key(
 #[cfg(test)]
 mod vendo_crypto_tests {
     use super::*;
+
+    #[test]
+    fn encrypted_payload_round_trips_and_rejects_tampering() {
+        let key = [0x5au8; 32];
+        let plaintext = r#"{"type":"PAYMENT","amount":5}"#;
+
+        let encrypted = encrypt_payload(plaintext, &key).unwrap();
+        assert_eq!(decrypt_payload(&encrypted, &key).unwrap(), plaintext);
+
+        let mut tampered = encrypted;
+        let last = tampered.len() - 1;
+        tampered[last] ^= 0x01;
+        assert!(decrypt_payload(&tampered, &key).is_err());
+    }
 
     #[test]
     fn valid_authentication_proof_is_accepted() {

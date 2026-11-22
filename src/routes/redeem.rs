@@ -158,10 +158,14 @@ pub fn redeem(server: &mut Server) {
 
             session.settle(current_timestamp());
 
-            // "Recoverable" means the credential still points to a live,
-            // unexpired customer session. Actual transfer is permitted only
-            // after the seven-minute disconnect grace period in the redeem flow.
-            Ok(session.expired_at.is_none() && session.remaining_seconds > 0)
+            // Only the current recovery credential is reported as recoverable.
+            // Superseded voucher codes remain in the audit history but cannot
+            // recover or appear as the customer's latest voucher.
+            Ok(
+                session.recovery_voucher_code.as_deref() == Some(code)
+                    && session.expired_at.is_none()
+                    && session.remaining_seconds > 0
+            )
         })();
 
         match status {

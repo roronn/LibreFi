@@ -2323,6 +2323,8 @@ mod session_logic_tests {
 
         // A second vendo starts its own independent sequence at 1.
         let (vendo_two, _) = register_vendo("Payment Test Vendo Two").unwrap();
+        let vendo_two_connection_generation =
+            crate::routes::ws::state::register_vendo_connection(&vendo_two.vendo_id);
 
         // Give the second vendo its own independent customer session.
         let mut second_payment_session =
@@ -2380,6 +2382,15 @@ mod session_logic_tests {
             VendoPaymentResult::Credited { .. }
         ));
 
+        // The first successful payment released the reservation.
+        // Reserve again before accepting the next payment event.
+        reserve_vendo_for_session(
+            &vendo_two.vendo_id,
+            "test-second-vendo-session",
+            "test-second-vendo-mac",
+        )
+        .unwrap();
+
         // A failed payment must not consume the next sequence number.
         let second_vendo_event_two = VendoPaymentEvent {
             vendo_id: vendo_two.vendo_id.clone(),
@@ -2418,6 +2429,13 @@ mod session_logic_tests {
                 .unwrap()
                 .remaining_seconds,
             25
+        );
+
+        assert!(
+            crate::routes::ws::state::unregister_vendo_connection(
+                &vendo_two.vendo_id,
+                vendo_two_connection_generation,
+            )
         );
     }
 }

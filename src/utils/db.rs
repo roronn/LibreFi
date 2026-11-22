@@ -939,6 +939,29 @@ pub fn get_vendo_reservation_for_session(
 
     Ok(None)
 }
+
+/// Looks up the active customer reservation for a specific vendo.
+pub fn get_vendo_reservation_for_vendo(
+    vendo_id: &str,
+) -> Result<Option<VendoReservation>, String> {
+    let db = get_db();
+    let read_txn = db.begin_read().map_err(|e| e.to_string())?;
+    let reservations = read_txn
+        .open_table(VENDO_RESERVATIONS_TABLE)
+        .map_err(|e| e.to_string())?;
+
+    match reservations.get(vendo_id).map_err(|e| e.to_string())? {
+        Some(value) => {
+            let reservation: VendoReservation =
+                serde_json::from_str(value.value()).map_err(|e| e.to_string())?;
+            if reservation.vendo_id != vendo_id {
+                return Err("Vendo reservation ID mismatch".to_string());
+            }
+            Ok(Some(reservation))
+        }
+        None => Ok(None),
+    }
+}
 pub fn get_session(session_id: &str) -> Result<Option<Session>, String> {
     let db = get_db();
     let read_txn = db.begin_read().map_err(|e| e.to_string())?;

@@ -997,6 +997,99 @@ pub fn get_session(session_id: &str) -> Result<Option<Session>, String> {
     }
 }
 
+/// Permanently deletes one customer session and revokes all credentials tied to it.
+pub fn delete_customer_session(session_id: &str) -> Result<(), String> {
+    let db = get_db();
+    let write_txn = db.begin_write().map_err(|error| error.to_string())?;
+
+    {
+        let sessions = write_txn.open_table(SESSIONS_TABLE).map_err(|error| error.to_string())?;
+        if sessions.get(session_id).map_err(|error| error.to_string())?.is_none() {
+            return Err("Customer session not found".to_string());
+        }
+    }
+
+    crate::utils::customer_identity::revoke_customer_credentials_in_transaction(&write_txn, session_id)?;
+
+    let device_macs = {
+        let devices = write_txn.open_table(DEVICE_SESSIONS_TABLE).map_err(|error| error.to_string())?;
+        devices.iter().map_err(|error| error.to_string())?
+            .map(|entry| {
+                let (key, value) = entry.map_err(|error| error.to_string())?;
+                Ok(if value.value() == session_id { Some(key.value().to_string()) } else { None })
+            })
+            .collect::<Result<Vec<_>, String>>()?.into_iter().flatten().collect::<Vec<_>>()
+    };
+    {
+        let mut devices = write_txn.open_table(DEVICE_SESSIONS_TABLE).map_err(|error| error.to_string())?;
+        for mac in device_macs { devices.remove(mac.as_str()).map_err(|error| error.to_string())?; }
+    }
+
+    let reservation_ids = {
+        let reservations = write_txn.open_table(VENDO_RESERVATIONS_TABLE).map_err(|error| error.to_string())?;
+        reservations.iter().map_err(|error| error.to_string())?
+            .map(|entry| {
+                let (key, value) = entry.map_err(|error| error.to_string())?;
+                let reservation: VendoReservation = serde_json::from_str(value.value()).map_err(|error| error.to_string())?;
+                Ok(if reservation.session_id == session_id { Some(key.value().to_string()) } else { None })
+            })
+            .collect::<Result<Vec<_>, String>>()?.into_iter().flatten().collect::<Vec<_>>()
+    };
+    {
+        let mut reservations = write_txn.open_table(VENDO_RESERVATIONS_TABLE).map_err(|error| error.to_string())?;
+        for vendo_id in reservation_ids { reservations.remove(vendo_id.as_str()).map_err(|error| error.to_string())?; }
+    }
+
+    let customer_ids = {
+        let customers = write_txn.open_table(CUSTOMERS_TABLE).map_err(|error| error.to_string())?;
+        customers.iter().map_err(|error| error.to_string())?
+            .map(|entry| {
+                let (key, value) = entry.map_err(|error| error.to_string())?;
+                let customer: Customer = serde_json::from_str(value.value()).map_err(|error| error.to_string())?;
+                Ok(if customer.active_session_id == session_id { Some(key.value().to_string()) } else { None })
+            })
+            .collect::<Result<Vec<_>, String>>()?.into_iter().flatten().collect::<Vec<_>>()
+    };
+    {
+        let mut customers = write_txn.open_table(CUSTOMERS_TABLE).map_err(|error| error.to_string())?;
+        for customer_id in customer_ids { customers.remove(customer_id.as_str()).map_err(|error| error.to_string())?; }
+    }
+    {
+        let mut sessions = write_txn.open_table(SESSIONS_TABLE).map_err(|error| error.to_string())?;
+        sessions.remove(session_id).map_err(|error| error.to_string())?;
+    }
+
+    write_txn.commit().map_err(|error| error.to_string())
+}
+
+/// Deletes a vendo registration and its active credential/reservation.
+/// Payment transaction history is retained for audit purposes.
+pub fn delete_vendo(vendo_id: &str) -> Result<(), String> {
+    let db = get_db();
+    let write_txn = db.begin_write().map_err(|error| error.to_string())?;
+
+    {
+        let mut vendos = write_txn.open_table(VENDOS_TABLE).map_err(|error| error.to_string())?;
+        if vendos.remove(vendo_id).map_err(|error| error.to_string())?.is_none() {
+            return Err("Vendo not found".to_string());
+        }
+    }
+    {
+        let mut credentials = write_txn.open_table(VENDO_CREDENTIALS_TABLE).map_err(|error| error.to_string())?;
+        credentials.remove(vendo_id).map_err(|error| error.to_string())?;
+    }
+    {
+        let mut reservations = write_txn.open_table(VENDO_RESERVATIONS_TABLE).map_err(|error| error.to_string())?;
+        reservations.remove(vendo_id).map_err(|error| error.to_string())?;
+    }
+    {
+        let mut sequences = write_txn.open_table(VENDO_SEQUENCES_TABLE).map_err(|error| error.to_string())?;
+        sequences.remove(vendo_id).map_err(|error| error.to_string())?;
+    }
+
+    write_txn.commit().map_err(|error| error.to_string())
+}
+
 pub fn find_session_by_mac(mac: &str) -> Result<Option<String>, String> {
     let db = get_db();
     let read_txn = db.begin_read().map_err(|e| e.to_string())?;

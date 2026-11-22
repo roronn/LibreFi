@@ -362,7 +362,7 @@ async fn handle_socket(mut socket: WebSocket, ip: String) {
                 ) {
                     Ok(VendoPaymentResult::Credited {
                         session_id: _credited_session_id,
-                        session: _credited_session,
+                        session: credited_session,
                         browser_token,
                     }) => {
                         let mut customer_event = json!({
@@ -370,6 +370,10 @@ async fn handle_socket(mut socket: WebSocket, ip: String) {
                             "value": payment.amount,
                             "time": seconds,
                         });
+
+                        if let Some(code) = credited_session.recovery_voucher_code {
+                            customer_event["recovery_voucher"] = json!(code);
+                        }
 
                         if let Some(token) = browser_token {
                             customer_event["browser_token"] = json!(token);

@@ -2130,11 +2130,11 @@ mod session_logic_tests {
         voucher_session.remaining_seconds = 200;
         voucher_session.paused = true;
 
-        create_session(
+        let voucher_browser_token = generate_browser_token().unwrap();
+        create_session_without_device(
             "test-voucher-session",
             &voucher_session,
-            "test-mac-voucher",
-            "test-token-voucher",
+            &voucher_browser_token,
         )
         .unwrap();
 
@@ -2161,7 +2161,7 @@ mod session_logic_tests {
         }
 
         let (voucher_session_id, credited_session, credited, voucher_token) =
-            redeem_voucher_for_session("TESTVOUCHER1", "test-mac-voucher").unwrap();
+            redeem_voucher_for_customer_session("TESTVOUCHER1", Some(&voucher_browser_token)).unwrap();
 
         assert_eq!(voucher_session_id, "test-voucher-session");
         assert_eq!(credited_session.remaining_seconds, 500);
@@ -2188,13 +2188,39 @@ mod session_logic_tests {
         }
 
         // 4. Recovering a used voucher must not credit its time again.
+        set_session_wifi_connected("test-voucher-session", false).unwrap();
+        {
+            let write_txn = get_db().begin_write().unwrap();
+            {
+                let mut sessions = write_txn.open_table(SESSIONS_TABLE).unwrap();
+                let mut session: Session = serde_json::from_str(
+                    sessions.get("test-voucher-session").unwrap().unwrap().value()
+                ).unwrap();
+                session.disconnected_at = Some(
+                    current_timestamp().saturating_sub(WIFI_GRACE_SECONDS + 1)
+                );
+                let session_json = serde_json::to_string(&session).unwrap();
+                sessions.insert("test-voucher-session", session_json.as_str()).unwrap();
+            }
+            write_txn.commit().unwrap();
+        }
+
         let (recovered_id, recovered_session, credited_again, recovery_token) =
-            redeem_voucher_for_session("TESTVOUCHER1", "test-mac-voucher").unwrap();
+            redeem_voucher_for_customer_session("TESTVOUCHER1", None).unwrap();
 
         assert_eq!(recovered_id, "test-voucher-session");
         assert_eq!(recovered_session.remaining_seconds, 500);
         assert!(!credited_again);
-        assert!(recovery_token.is_none());
+        let recovery_token = recovery_token.expect("Recovery must issue a fresh browser token");
+        assert_eq!(
+            find_session_by_browser_token(&recovery_token).unwrap(),
+            Some("test-voucher-session".to_string())
+        );
+        assert_eq!(
+            find_session_by_browser_token(&voucher_browser_token).unwrap(),
+            None,
+            "Recovery must revoke the previous browser token"
+        );
 
         // 5. An unused voucher after expiry must create a new session.
         let mut expired_voucher_session = Session::new(
@@ -2205,11 +2231,11 @@ mod session_logic_tests {
         expired_voucher_session.remaining_seconds = 10;
         expired_voucher_session.last_accounted_at = now.saturating_sub(100);
 
-        create_session(
+        let expired_voucher_browser_token = generate_browser_token().unwrap();
+        create_session_without_device(
             "test-expired-voucher-session",
             &expired_voucher_session,
-            "test-mac-expired-voucher",
-            "test-token-expired-voucher",
+            &expired_voucher_browser_token,
         )
         .unwrap();
 
@@ -2239,7 +2265,11 @@ mod session_logic_tests {
         }
 
         let (replacement_id, replacement_session, replacement_credited, replacement_token) =
-            redeem_voucher_for_session("TESTVOUCHER2", "test-mac-expired-voucher").unwrap();
+            redeem_voucher_for_customer_session(
+                "TESTVOUCHER2",
+                Some(&expired_voucher_browser_token),
+            )
+            .unwrap();
 
         assert_ne!(replacement_id, "test-expired-voucher-session");
         assert_eq!(replacement_session.remaining_seconds, 600);
@@ -2249,10 +2279,6 @@ mod session_logic_tests {
         assert_eq!(
             find_session_by_browser_token(&replacement_token).unwrap(),
             Some(replacement_id.clone())
-        );
-        assert_eq!(
-            find_session_by_mac("test-mac-expired-voucher").unwrap(),
-            Some(replacement_id)
         );
         assert!(
             get_session("test-expired-voucher-session")

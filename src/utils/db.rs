@@ -2403,6 +2403,10 @@ mod session_logic_tests {
         assert_eq!(voucher_session_id, "test-voucher-session");
         assert_eq!(credited_session.remaining_seconds, 500);
         assert!(credited);
+        assert_eq!(
+            credited_session.recovery_voucher_code.as_deref(),
+            Some("TESTVOUCHER1")
+        );
 
         let voucher_customer_id = credited_session
             .customer_id

@@ -95,6 +95,21 @@ async function storeKeyPair(pair: CustomerKeyPair): Promise<void> {
     }
 }
 
+export async function clearStoredCustomerKey(): Promise<void> {
+    const database = await openIdentityDatabase();
+    try {
+        await new Promise<void>((resolve, reject) => {
+            const transaction = database.transaction(STORE_NAME, "readwrite");
+            transaction.objectStore(STORE_NAME).delete(KEY_NAME);
+            transaction.oncomplete = () => resolve();
+            transaction.onerror = () => reject(transaction.error || new Error("Could not clear customer key"));
+            transaction.onabort = () => reject(transaction.error || new Error("Customer key removal was aborted"));
+        });
+    } finally {
+        database.close();
+    }
+}
+
 async function getOrCreateKeyPair(): Promise<CustomerKeyPair | null> {
     try {
         const stored = await readStoredKeyPair();

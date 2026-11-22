@@ -4,7 +4,7 @@ import { Button } from "../ui/button";
 import { Input } from "../ui/input";
 import { Label } from "../ui/label";
 import { toast } from "../ui/toast";
-import { Copy, Loader2, Plus, RefreshCw, RotateCw, ShieldOff } from "lucide-react";
+import { Copy, Loader2, Plus, RefreshCw, RotateCw, ShieldOff, Trash2 } from "lucide-react";
 
 type Vendo = {
     vendo_id: string;
@@ -96,13 +96,14 @@ export default function AdminVendos() {
         }
     }
 
-    async function updateVendo(vendo: Vendo, action: "enable" | "disable" | "rotate" | "revoke") {
+    async function updateVendo(vendo: Vendo, action: "enable" | "disable" | "rotate" | "revoke" | "delete") {
         if (action === "revoke" && !window.confirm(`Revoke the credential for "${vendo.name}"? The device will no longer authenticate.`)) return;
         if (action === "rotate" && !window.confirm(`Rotate the credential for "${vendo.name}"? Its old credential will stop working.`)) return;
+        if (action === "delete" && !window.confirm(`Permanently delete "${vendo.name}"? Its registration, credential, and active reservation will be removed. Payment history will be retained.`)) return;
 
         setBusyId(vendo.vendo_id);
         try {
-            const method = action === "enable" || action === "disable" ? "PUT" : "POST";
+            const method = action === "enable" || action === "disable" ? "PUT" : action === "delete" ? "DELETE" : "POST";
             const endpoint = action === "rotate"
                 ? "/api/admin/vendos/rotate"
                 : action === "revoke"
@@ -130,6 +131,9 @@ export default function AdminVendos() {
                     position: "top-center",
                     description: "Save the new credential now. The previous one is invalid.",
                 });
+            } else if (action === "delete") {
+                setCredentialNotice((current) => current?.vendoName === vendo.name ? null : current);
+                toast.success("Vendo deleted", { position: "top-center" });
             } else if (action === "revoke") {
                 setCredentialNotice(null);
                 toast.success("Credential revoked", { position: "top-center" });
@@ -282,6 +286,14 @@ export default function AdminVendos() {
                                         onClick={() => void updateVendo(vendo, "revoke")}
                                     >
                                         <ShieldOff className="mr-1" size={14} /> Revoke
+                                    </Button>
+                                    <Button
+                                        size="sm"
+                                        variant="destructive"
+                                        disabled={busyId === vendo.vendo_id}
+                                        onClick={() => void updateVendo(vendo, "delete")}
+                                    >
+                                        <Trash2 className="mr-1" size={14} /> Delete
                                     </Button>
                                 </div>
                             </article>

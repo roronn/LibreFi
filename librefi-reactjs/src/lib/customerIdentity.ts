@@ -141,7 +141,10 @@ async function signChallenge(
 
 /** Authenticates an existing browser key and returns a fresh browser token. */
 export async function authenticateStoredCustomerKey(): Promise<string | null> {
-    const pair = await readStoredKeyPair().catch(() => null);
+    // A missing key is different from a failed key-auth request. Propagate
+    // storage/network errors so the caller does not silently create a new
+    // session when a previously registered key may still recover the old one.
+    const pair = await readStoredKeyPair();
     if (!pair) return null;
 
     const publicKey = toHex(pair.publicKey);

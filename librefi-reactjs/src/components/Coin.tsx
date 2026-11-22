@@ -34,6 +34,9 @@ function Coin({ children, onClose }: { children: ReactElement, onClose?: () => v
     const [vendoOptions, setVendoOptions] = useState<Array<{ vendo_id: string; name: string }>>([]);
     const [isChoosingVendo, setIsChoosingVendo] = useState(false);
     const [isSelectingVendo, setIsSelectingVendo] = useState(false);
+    const [assignedVendoName, setAssignedVendoName] = useState("");
+    const [isSimulatingCoin, setIsSimulatingCoin] = useState(false);
+    const isDemoMode = new URLSearchParams(window.location.search).get("demo") === "1";
     const wsRef = useRef<WebSocket | null>(null);
     const pingRef = useRef<number | null>(null);
     const timerRef = useRef<number | null>(null);
@@ -59,6 +62,8 @@ function Coin({ children, onClose }: { children: ReactElement, onClose?: () => v
         setVendoOptions([]);
         setIsChoosingVendo(false);
         setIsSelectingVendo(false);
+        setAssignedVendoName("");
+        setIsSimulatingCoin(false);
         onClose?.();
     }
 
@@ -90,7 +95,23 @@ function Coin({ children, onClose }: { children: ReactElement, onClose?: () => v
         }
     }
 
-    function handleCoin() {
+    async function handleCoin() {
+        if (isDemoMode) {
+            try {
+                const response = await fetch("/test/vendo/activate", { method: "POST" });
+                const result = await response.json();
+                if (!response.ok) {
+                    throw new Error(typeof result.error === "string" ? result.error : "Could not activate the dummy vendo");
+                }
+            } catch (error) {
+                toast.error("Demo vendo unavailable", {
+                    description: error instanceof Error ? error.message : "Could not start the local demo",
+                    position: "top-center"
+                });
+                return;
+            }
+        }
+
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
         const wsUrl = `${protocol}//${window.location.host}/ws`;
         const ws = new WebSocket(wsUrl);
@@ -166,6 +187,9 @@ function Coin({ children, onClose }: { children: ReactElement, onClose?: () => v
                     setIsChoosingVendo(false);
                     setIsSelectingVendo(false);
                     setVendoOptions([]);
+                    if (typeof data.vendo_name === "string") {
+                        setAssignedVendoName(data.vendo_name);
+                    }
                     void loadLastVoucher();
                     setIsOpen(true);
                     setTimeLeft(29);
@@ -289,6 +313,7 @@ function Coin({ children, onClose }: { children: ReactElement, onClose?: () => v
                                     const ws = wsRef.current;
                                     if (!ws || ws.readyState !== WebSocket.OPEN) return;
                                     setIsSelectingVendo(true);
+                                    setAssignedVendoName(vendo.name);
                                     ws.send(JSON.stringify({
                                         type: "SELECT_VENDO",
                                         vendo_id: vendo.vendo_id
@@ -328,6 +353,56 @@ function Coin({ children, onClose }: { children: ReactElement, onClose?: () => v
                                         Your previous voucher could not be recovered. Your session has expired. Please purchase a new voucher or insert coins.
                                     </p>
                                 ) : null}
+                            </div>
+                        )}
+
+                        {isDemoMode && /dummy|test/i.test(assignedVendoName) && (
+                            <div className="flex flex-col gap-2 rounded-md border border-dashed p-3">
+                                <p className="text-center text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                                    Local demo · {assignedVendoName}
+                                </p>
+                                <Button
+                                    type="button"
+                                    variant="outline"
+                                    className="w-full"
+                                    disabled={isSimulatingCoin}
+                                    onClick={async () => {
+                                        const browserToken = localStorage.getItem("librefi_browser_token");
+                                        if (!browserToken) {
+                                            toast.error("Customer session not ready", {
+                                                description: "Refresh the page and open Insert Coin again.",
+                                                position: "top-center"
+                                            });
+                                            return;
+                                        }
+
+                                        setIsSimulatingCoin(true);
+                                        try {
+                                            const response = await fetch("/test/vendo/payment", {
+                                                method: "POST",
+                                                headers: { "Content-Type": "application/json" },
+                                                body: JSON.stringify({ browser_token: browserToken, amount: 10 })
+                                            });
+                                            const result = await response.json();
+                                            if (!response.ok) {
+                                                throw new Error(typeof result.error === "string" ? result.error : "Demo payment failed");
+                                            }
+                                            toast.success("Demo coin accepted", {
+                                                description: `₱${result.amount} credited to this customer session.`,
+                                                position: "top-center"
+                                            });
+                                        } catch (error) {
+                                            toast.error("Demo payment failed", {
+                                                description: error instanceof Error ? error.message : "Could not simulate the coin",
+                                                position: "top-center"
+                                            });
+                                        } finally {
+                                            setIsSimulatingCoin(false);
+                                        }
+                                    }}
+                                >
+                                    {isSimulatingCoin ? "Processing demo coin..." : "Simulate ₱10 Coin"}
+                                </Button>
                             </div>
                         )}
 

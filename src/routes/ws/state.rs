@@ -3,6 +3,50 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex, OnceLock, mpsc};
 use std::time::{Duration, Instant};
+use tokio::sync::mpsc::UnboundedSender;
+
+static NEXT_CUSTOMER_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
+static CUSTOMER_CONNECTIONS: LazyLock<
+    Mutex<HashMap<String, HashMap<u64, UnboundedSender<serde_json::Value>>>>,
+> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Registers one browser WebSocket for a customer session.
+/// Multiple tabs may be connected to the same session simultaneously.
+pub fn register_customer_connection(
+    session_id: &str,
+    sender: UnboundedSender<serde_json::Value>,
+) -> u64 {
+    let connection_id = NEXT_CUSTOMER_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
+    CUSTOMER_CONNECTIONS
+        .lock()
+        .unwrap()
+        .entry(session_id.to_string())
+        .or_default()
+        .insert(connection_id, sender);
+    connection_id
+}
+
+/// Removes only the specified browser connection.
+pub fn unregister_customer_connection(session_id: &str, connection_id: u64) {
+    let mut connections = CUSTOMER_CONNECTIONS.lock().unwrap();
+    if let Some(session_connections) = connections.get_mut(session_id) {
+        session_connections.remove(&connection_id);
+        if session_connections.is_empty() {
+            connections.remove(session_id);
+        }
+    }
+}
+
+/// Sends a payment/session event to every connected tab for this session.
+pub fn notify_customer_session(session_id: &str, message: serde_json::Value) {
+    let mut connections = CUSTOMER_CONNECTIONS.lock().unwrap();
+    if let Some(session_connections) = connections.get_mut(session_id) {
+        session_connections.retain(|_, sender| sender.send(message.clone()).is_ok());
+        if session_connections.is_empty() {
+            connections.remove(session_id);
+        }
+    }
+}
 
 pub enum RelayResult {
     Available,

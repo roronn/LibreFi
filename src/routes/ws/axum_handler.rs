@@ -7,19 +7,83 @@ use axum::{
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::Deserialize;
+use serde_json::{Value, json};
 use std::net::SocketAddr;
 use tokio::time::{Duration, timeout};
 
 use crate::{
-    routes::ws::state::{register_vendo_connection, unregister_vendo_connection},
+    routes::ws::state::{
+        is_current_vendo_connection, notify_customer_session, register_vendo_connection,
+        unregister_vendo_connection,
+    },
     utils::{
-        crypto::{derive_vendo_session_key, generate_vendo_challenge, verify_vendo_auth_proof},
-        db::get_vendo_auth_verifier,
+        crypto::{
+            decrypt_payload, derive_vendo_session_key, encrypt_payload,
+            generate_vendo_challenge, verify_vendo_auth_proof,
+        },
+        db::{
+            VendoPaymentEvent, VendoPaymentResult, convert_amount_to_time,
+            credit_vendo_payment_for_session, get_vendo_auth_verifier,
+            get_vendo_reservation_for_vendo,
+        },
     },
 };
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_HANDSHAKE_MESSAGE: usize = 2048;
+const MAX_APPLICATION_MESSAGE: usize = 4096;
+
+#[derive(Deserialize)]
+struct EncryptedEnvelope {
+    #[serde(rename = "type")]
+    msg_type: String,
+    payload: String,
+}
+
+#[derive(Deserialize)]
+struct PaymentMessage {
+    #[serde(rename = "type")]
+    msg_type: String,
+    event_id: String,
+    sequence: u64,
+    amount: u32,
+    pulse_count: u32,
+    device_timestamp: u64,
+}
+
+async fn send_encrypted_json(
+    socket: &mut WebSocket,
+    session_key: &[u8; 32],
+    value: Value,
+) -> Result<(), ()> {
+    let plaintext = value.to_string();
+    let encrypted = encrypt_payload(&plaintext, session_key).map_err(|_| ())?;
+    let envelope = json!({
+        "type": "ENCRYPTED",
+        "payload": STANDARD.encode(encrypted),
+    });
+
+    socket
+        .send(Message::Text(envelope.to_string().into()))
+        .await
+        .map_err(|_| ())
+}
+
+async fn send_payment_rejection(
+    socket: &mut WebSocket,
+    session_key: &[u8; 32],
+    reason: &str,
+) -> Result<(), ()> {
+    send_encrypted_json(
+        socket,
+        session_key,
+        json!({
+            "type": "PAYMENT_REJECTED",
+            "reason": reason,
+        }),
+    )
+    .await
+}
 
 #[derive(Deserialize)]
 struct HelloMessage {
@@ -196,11 +260,7 @@ async fn handle_socket(mut socket: WebSocket, ip: String) {
 
     crate::debug_println!("[WS] Authenticated vendo {} from {}", vendo_id, ip);
 
-    // Keep the session key alive for this connection.
-    let _session_key = session_key;
-
-    // Stage 2 only: maintain the authenticated connection.
-    // Application messages will be added in the subsequent stages.
+    // Only the current authenticated connection generation may process payments.
     loop {
         match socket.recv().await {
             Some(Ok(Message::Ping(payload))) => {
@@ -209,12 +269,168 @@ async fn handle_socket(mut socket: WebSocket, ip: String) {
                 }
             }
             Some(Ok(Message::Pong(_))) => {}
+            Some(Ok(Message::Text(text))) => {
+                if !is_current_vendo_connection(&vendo_id, generation) {
+                    break;
+                }
+
+                let text = text.to_string();
+                if text.len() > MAX_APPLICATION_MESSAGE {
+                    reject_connection(&mut socket).await;
+                    break;
+                }
+
+                let envelope: EncryptedEnvelope = match serde_json::from_str(&text) {
+                    Ok(message) if message.msg_type == "ENCRYPTED" => message,
+                    _ => {
+                        reject_connection(&mut socket).await;
+                        break;
+                    }
+                };
+
+                let encrypted = match STANDARD.decode(&envelope.payload) {
+                    Ok(bytes) => bytes,
+                    Err(_) => {
+                        reject_connection(&mut socket).await;
+                        break;
+                    }
+                };
+
+                let plaintext = match decrypt_payload(&encrypted, &session_key) {
+                    Ok(plaintext) if plaintext.len() <= MAX_APPLICATION_MESSAGE => plaintext,
+                    _ => {
+                        reject_connection(&mut socket).await;
+                        break;
+                    }
+                };
+
+                let payment: PaymentMessage = match serde_json::from_str(&plaintext) {
+                    Ok(message) if message.msg_type == "PAYMENT" => message,
+                    _ => {
+                        reject_connection(&mut socket).await;
+                        break;
+                    }
+                };
+
+                let reservation = match get_vendo_reservation_for_vendo(&vendo_id) {
+                    Ok(Some(reservation)) => reservation,
+                    Ok(None) => {
+                        let _ = send_payment_rejection(
+                            &mut socket,
+                            &session_key,
+                            "No customer session has reserved this vendo",
+                        )
+                        .await;
+                        continue;
+                    }
+                    Err(error) => {
+                        eprintln!("Vendo reservation lookup failed: {}", error);
+                        let _ = send_payment_rejection(
+                            &mut socket,
+                            &session_key,
+                            "Unable to verify the active reservation",
+                        )
+                        .await;
+                        continue;
+                    }
+                };
+
+                let seconds = convert_amount_to_time(payment.amount);
+                if seconds == 0 {
+                    let _ = send_payment_rejection(
+                        &mut socket,
+                        &session_key,
+                        "Payment amount does not match an active rate",
+                    )
+                    .await;
+                    continue;
+                }
+
+                let event = VendoPaymentEvent {
+                    vendo_id: vendo_id.clone(),
+                    event_id: payment.event_id.clone(),
+                    sequence: payment.sequence,
+                    amount: payment.amount,
+                    pulse_count: payment.pulse_count,
+                    device_timestamp: payment.device_timestamp,
+                };
+
+                match credit_vendo_payment_for_session(
+                    &reservation.session_id,
+                    seconds as u64,
+                    event,
+                ) {
+                    Ok(VendoPaymentResult::Credited {
+                        session_id: _credited_session_id,
+                        session: _credited_session,
+                        browser_token,
+                    }) => {
+                        let mut customer_event = json!({
+                            "type": "coin",
+                            "value": payment.amount,
+                            "time": seconds,
+                        });
+
+                        if let Some(token) = browser_token {
+                            customer_event["browser_token"] = json!(token);
+                        }
+
+                        // The browser socket is registered under the reserved
+                        // session ID even when an expired session was replaced.
+                        notify_customer_session(
+                            &reservation.session_id,
+                            customer_event,
+                        );
+
+                        if send_encrypted_json(
+                            &mut socket,
+                            &session_key,
+                            json!({
+                                "type": "PAYMENT_ACCEPTED",
+                                "event_id": payment.event_id,
+                                "sequence": payment.sequence,
+                                "credited_seconds": seconds,
+                            }),
+                        )
+                        .await
+                        .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Ok(VendoPaymentResult::Duplicate { original_event_id }) => {
+                        if send_encrypted_json(
+                            &mut socket,
+                            &session_key,
+                            json!({
+                                "type": "PAYMENT_DUPLICATE",
+                                "event_id": original_event_id,
+                            }),
+                        )
+                        .await
+                        .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        if send_payment_rejection(
+                            &mut socket,
+                            &session_key,
+                            &error,
+                        )
+                        .await
+                        .is_err()
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
             Some(Ok(Message::Close(_))) | None | Some(Err(_)) => {
                 break;
             }
             Some(Ok(_)) => {
-                // Do not accept application messages before their
-                // authenticated encrypted protocol is implemented.
                 reject_connection(&mut socket).await;
                 break;
             }

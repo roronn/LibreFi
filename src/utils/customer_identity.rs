@@ -308,18 +308,16 @@ pub fn complete_customer_challenge(
         let mut keys = write_txn
             .open_table(CUSTOMER_DEVICE_KEYS_TABLE)
             .map_err(|error| error.to_string())?;
-        if let Some(existing_json) = keys
-            .get(key_hash.as_str())
-            .map_err(|error| error.to_string())?
-            .map(|value| value.value().to_string())
-        {
+        let existing_json = {
+            keys.get(key_hash.as_str())
+                .map_err(|error| error.to_string())?
+                .map(|value| value.value().to_string())
+        };
+
+        let key_conflict = if let Some(existing_json) = existing_json {
             let existing: CustomerDeviceKey =
                 serde_json::from_str(&existing_json).map_err(|error| error.to_string())?;
-            if existing.session_id != challenge.session_id || existing.revoked_at.is_some() {
-                drop(keys);
-                write_txn.commit().map_err(|error| error.to_string())?;
-                return Err("Customer key is already assigned or revoked".to_string());
-            }
+            existing.session_id != challenge.session_id || existing.revoked_at.is_some()
         } else {
             let record = CustomerDeviceKey {
                 key_hash: key_hash.clone(),
@@ -332,8 +330,14 @@ pub fn complete_customer_challenge(
                 serde_json::to_string(&record).map_err(|error| error.to_string())?;
             keys.insert(key_hash.as_str(), record_json.as_str())
                 .map_err(|error| error.to_string())?;
-        }
+            false
+        };
         drop(keys);
+
+        if key_conflict {
+            write_txn.commit().map_err(|error| error.to_string())?;
+            return Err("Customer key is already assigned or revoked".to_string());
+        }
         write_txn.commit().map_err(|error| error.to_string())?;
 
         return Ok(CustomerAuthResult {
@@ -359,18 +363,19 @@ pub fn complete_customer_challenge(
         return Err("Customer key is not active".to_string());
     }
 
-    let sessions = write_txn
-        .open_table(SESSIONS_TABLE)
-        .map_err(|error| error.to_string())?;
-    if sessions
-        .get(challenge.session_id.as_str())
-        .map_err(|error| error.to_string())?
-        .is_none()
-    {
+    let session_exists = {
+        let sessions = write_txn
+            .open_table(SESSIONS_TABLE)
+            .map_err(|error| error.to_string())?;
+        sessions
+            .get(challenge.session_id.as_str())
+            .map_err(|error| error.to_string())?
+            .is_some()
+    };
+    if !session_exists {
         write_txn.commit().map_err(|error| error.to_string())?;
         return Err("Customer session not found".to_string());
     }
-    drop(sessions);
 
     let browser_token = generate_browser_token()?;
     let token_hash = hash_recovery_token(&browser_token);

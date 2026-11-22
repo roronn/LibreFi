@@ -2,6 +2,7 @@ import AdminDashboard from "#components/admin/Dashboard";
 import AdminLayout from "#components/admin/Layout";
 import AdminSettings from "#components/admin/Settings";
 import AdminUsers from "#components/admin/Users";
+import AdminVendos from "#components/admin/Vendos";
 import AdminVouchRates from "#components/admin/VouchRates";
 import { Button } from "#components/ui/button";
 import { Input } from "#components/ui/input";
@@ -91,6 +92,7 @@ export function Admin() {
             <AdminLayout>
                 <Route path="/dashboard"><AdminDashboard /></Route>
                 <Route path="/users"><AdminUsers /></Route>
+                <Route path="/vendos"><AdminVendos /></Route>
                 <Route path="/vouch_rates"><AdminVouchRates /></Route>
                 <Route path="/settings"><AdminSettings /></Route>
             </AdminLayout>

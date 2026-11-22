@@ -59,7 +59,7 @@ fn set_fail_count(client_key: &str, count: u32) {
                 .unwrap_or_default()
                 .as_secs();
 
-            let key = format!("redeem_fail:{}", mac);
+            let key = format!("redeem_fail:{}", client_key);
             let value = format!("{}:{}", count, now);
 
             let _ = table.insert(key.as_str(), value.as_str());
@@ -74,7 +74,7 @@ fn clear_fail_count(client_key: &str) {
 
     if let Ok(write_txn) = db.begin_write() {
         if let Ok(mut table) = write_txn.open_table(CONFIG_TABLE) {
-            let key = format!("redeem_fail:{}", mac);
+            let key = format!("redeem_fail:{}", client_key);
             let _ = table.remove(key.as_str());
         }
 

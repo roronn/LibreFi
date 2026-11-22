@@ -15,7 +15,11 @@ import {
 import { useCallback, useEffect, useState } from "react";
 import type { UserType } from ".././types/user";
 import { toast } from "#components/ui/toast";
-import { authenticateStoredCustomerKey, registerCustomerKey } from "#lib/customerIdentity";
+import {
+    authenticateStoredCustomerKey,
+    clearStoredCustomerKey,
+    registerCustomerKey
+} from "#lib/customerIdentity";
 
 function User() {
     const [user, setUser] = useState<UserType>();
@@ -245,7 +249,7 @@ function User() {
 
                     <div className="flex flex-col items-center">
                         <Voucher
-                            onRedeemed={(browserToken, redeemedCode) => {
+                            onRedeemed={async (browserToken, redeemedCode) => {
                                 if (
                                     browserToken &&
                                     /^[0-9a-fA-F]{64}$/.test(browserToken)
@@ -254,6 +258,13 @@ function User() {
                                         "librefi_browser_token",
                                         browserToken
                                     );
+                                    // Recovery or expired-session replacement revokes
+                                    // the old key. Remove it so init can enroll a fresh key.
+                                    try {
+                                        await clearStoredCustomerKey();
+                                    } catch {
+                                        // Browser-token authentication remains the fallback.
+                                    }
                                 }
 
                                 if (redeemedCode) {
@@ -263,7 +274,7 @@ function User() {
                                     );
                                 }
 
-                                void init();
+                                await init();
                             }}
                         >
                             <Button

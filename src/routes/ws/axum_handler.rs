@@ -573,10 +573,11 @@ mod auth_smoke_tests {
             let mut senders = Vec::with_capacity(VENDO_COUNT);
             for (mut client, session_id, session_key, index) in clients {
                 let barrier_for_worker = Arc::clone(&barrier);
+                let test_id_for_worker = test_id.clone();
                 senders.push(std::thread::spawn(move || {
                     barrier_for_worker.wait();
 
-                    let event_id = format!("ws-payment-{test_id}-{index}");
+                    let event_id = format!("ws-payment-{test_id_for_worker}-{index}");
                     let plaintext = serde_json::json!({
                         "type": "PAYMENT",
                         "event_id": event_id,

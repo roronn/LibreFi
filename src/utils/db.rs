@@ -2235,7 +2235,17 @@ mod session_logic_tests {
             .is_err()
         );
 
-        // Disabling a vendo must not block an already-reserved payment.
+        // A successful payment releases its reservation. A new payment
+        // requires a fresh reservation before it can be accepted.
+        set_vendo_enabled(&vendo_one.vendo_id, true).unwrap();
+        reserve_vendo_for_session(
+            &vendo_one.vendo_id,
+            "test-vendo-payment-session",
+            "test-vendo-payment-mac",
+        )
+        .unwrap();
+
+        // Disabling a vendo must not block a payment that is already reserved.
         set_vendo_enabled(&vendo_one.vendo_id, false).unwrap();
 
         // Disabled vendos retain valid device authentication.

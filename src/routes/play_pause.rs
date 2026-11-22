@@ -1,25 +1,54 @@
 use crate::network::server::Server;
 use crate::utils::db::{
-    current_timestamp, find_session_by_mac, get_db, Session, VendoReservation,
+    current_timestamp, find_session_by_browser_token, get_db, Session, VendoReservation,
     SESSIONS_TABLE, VENDO_RESERVATIONS_TABLE,
 };
 use crate::utils::get_mac_from_ip::get_mac_from_ip;
 use redb::ReadableTable;
+use serde::Deserialize;
+
+#[derive(Deserialize)]
+struct PlayPauseRequest {
+    browser_token: String,
+}
+
+fn is_valid_browser_token(token: &str) -> bool {
+    token.len() == 64 && token.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn is_valid_mac(mac: &str) -> bool {
+    let parts: Vec<&str> = mac.split(':').collect();
+    parts.len() == 6
+        && parts
+            .iter()
+            .all(|part| part.len() == 2 && part.bytes().all(|byte| byte.is_ascii_hexdigit()))
+}
 
 pub fn play_pause(server: &mut Server) {
     server.post("/api/play_pause", |req, res| {
-        let Some(mac) = get_mac_from_ip(&req.ip) else {
-            res.status = 403;
-            res.body = b"{\"error\":\"Device not recognized\"}".to_vec();
-            res.content_type = "application/json".to_string();
-            return;
+        let body: PlayPauseRequest = match serde_json::from_slice(&req.body) {
+            Ok(body) => body,
+            Err(_) => {
+                res.status = 400;
+                res.body = b"{\"error\":\"Browser token is required\"}".to_vec();
+                res.content_type = "application/json".to_string();
+                return;
+            }
         };
 
-        let session_id = match find_session_by_mac(&mac) {
+        if !is_valid_browser_token(&body.browser_token) {
+            res.status = 401;
+            res.body = b"{\"error\":\"Customer authentication required\"}".to_vec();
+            res.content_type = "application/json".to_string();
+            return;
+        }
+
+        // Session ownership is established by the browser token, never by MAC.
+        let session_id = match find_session_by_browser_token(&body.browser_token) {
             Ok(Some(id)) => id,
             Ok(None) => {
-                res.status = 404;
-                res.body = b"{\"error\":\"Session not found\"}".to_vec();
+                res.status = 401;
+                res.body = b"{\"error\":\"Customer authentication required\"}".to_vec();
                 res.content_type = "application/json".to_string();
                 return;
             }
@@ -30,6 +59,10 @@ pub fn play_pause(server: &mut Server) {
                 return;
             }
         };
+
+        // MAC is used only for local firewall enforcement, never to select
+        // or authenticate the customer's session.
+        let mac = get_mac_from_ip(&req.ip).filter(|value| is_valid_mac(value));
 
         let now = current_timestamp();
         let db = get_db();
@@ -92,6 +125,7 @@ pub fn play_pause(server: &mut Server) {
                 return;
             }
         };
+
         {
             let mut table = match write_txn.open_table(SESSIONS_TABLE) {
                 Ok(table) => table,
@@ -109,7 +143,8 @@ pub fn play_pause(server: &mut Server) {
                 return;
             }
         }
-        // Release expired session reservation.
+
+        // Release every reservation owned by this session if it has expired.
         if session.remaining_seconds == 0 {
             let matching_vendo_ids = {
                 let reservations = match write_txn.open_table(VENDO_RESERVATIONS_TABLE) {
@@ -125,7 +160,6 @@ pub fn play_pause(server: &mut Server) {
                 match reservations.iter() {
                     Ok(entries) => {
                         let mut ids = Vec::new();
-
                         for entry in entries {
                             let (key, value) = match entry {
                                 Ok(entry) => entry,
@@ -136,7 +170,6 @@ pub fn play_pause(server: &mut Server) {
                                     return;
                                 }
                             };
-
                             let reservation: VendoReservation =
                                 match serde_json::from_str(value.value()) {
                                     Ok(value) => value,
@@ -147,14 +180,10 @@ pub fn play_pause(server: &mut Server) {
                                         return;
                                     }
                                 };
-
-                            if reservation.session_id == session_id
-                                && reservation.mac == mac
-                            {
+                            if reservation.session_id == session_id {
                                 ids.push(key.value().to_string());
                             }
                         }
-
                         ids
                     }
                     Err(_) => {
@@ -175,7 +204,6 @@ pub fn play_pause(server: &mut Server) {
                     return;
                 }
             };
-
             for vendo_id in &matching_vendo_ids {
                 if reservations.remove(vendo_id.as_str()).is_err() {
                     res.status = 500;
@@ -185,6 +213,7 @@ pub fn play_pause(server: &mut Server) {
                 }
             }
         }
+
         if write_txn.commit().is_err() {
             res.status = 500;
             res.body = b"{\"error\":\"Could not commit session update\"}".to_vec();
@@ -193,17 +222,20 @@ pub fn play_pause(server: &mut Server) {
         }
 
         crate::debug_println!(
-            "-> [{}] MAC={} paused={} remaining_seconds={} pause_attempts={}",
-            action, mac, session.paused, session.remaining_seconds, session.pause_attempts
+            "-> [{}] session={} mac={:?} paused={} remaining_seconds={} pause_attempts={}",
+            action, session_id, mac, session.paused, session.remaining_seconds, session.pause_attempts
         );
 
         #[cfg(not(windows))]
-        {
+        if let Some(mac) = mac.as_deref() {
             if session.paused || session.remaining_seconds == 0 {
                 let cmd = format!("nft delete element inet librefi allowed_macs {{ {} }}", mac);
                 let _ = crate::utils::setup_captive_portal::run_sh_cmd(&cmd, true);
             } else {
-                let cmd = format!("nft add element inet librefi allowed_macs {{ {} timeout {}s }}", mac, session.remaining_seconds);
+                let cmd = format!(
+                    "nft add element inet librefi allowed_macs {{ {} timeout {}s }}",
+                    mac, session.remaining_seconds
+                );
                 let _ = crate::utils::setup_captive_portal::run_sh_cmd(&cmd, true);
             }
         }

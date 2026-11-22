@@ -2189,6 +2189,10 @@ mod session_logic_tests {
 
         // 4. Recovering a used voucher must not credit its time again.
         set_session_wifi_connected("test-voucher-session", false).unwrap();
+        assert!(
+            redeem_voucher_for_customer_session("TESTVOUCHER1", None).is_err(),
+            "A used voucher must not transfer during the seven-minute grace period"
+        );
         {
             let write_txn = get_db().begin_write().unwrap();
             {

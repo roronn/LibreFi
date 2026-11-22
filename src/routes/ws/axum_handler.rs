@@ -463,7 +463,6 @@ mod auth_smoke_tests {
             create_session, get_db, get_session, init_test_db_once, register_vendo,
             reserve_vendo_for_customer_session, Session, RATES_TABLE,
         };
-        use redb::WritableTable;
         use std::sync::{Arc, Barrier};
         use tungstenite::{connect, Message};
 
@@ -473,14 +472,14 @@ mod auth_smoke_tests {
         let test_id = crate::utils::db::generate_secure_id().unwrap();
 
         // Give this isolated test a known payment rate: 10 units = 60 seconds.
-        let rate_key = format!("ws-stress-rate-{test_id}");
+        let rate_key = u32::MAX - (crate::utils::db::current_timestamp() as u32 % 100_000);
         let rate_value = serde_json::json!({ "price": 10.0, "time": 60 }).to_string();
         {
             let db = get_db();
             let write_txn = db.begin_write().unwrap();
             {
                 let mut rates = write_txn.open_table(RATES_TABLE).unwrap();
-                rates.insert(rate_key.as_str(), rate_value.as_str()).unwrap();
+                rates.insert(rate_key, rate_value.as_str()).unwrap();
             }
             write_txn.commit().unwrap();
         }

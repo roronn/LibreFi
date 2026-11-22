@@ -2629,4 +2629,70 @@ mod session_logic_tests {
         ));
     }
 
+
+    #[test]
+    fn expired_session_releases_vendo_reservation() {
+        init_test_db_once();
+
+        let now = current_timestamp();
+        let (vendo, _) = register_vendo("Expired Reservation Cleanup Test").unwrap();
+        let generation = crate::routes::ws::state::register_vendo_connection(&vendo.vendo_id);
+
+        let expired_session_id = generate_secure_id().unwrap();
+        let mut expired_session =
+            Session::new("Expiring Reservation Customer".into(), "10.0.0.41".into(), now);
+        expired_session.remaining_seconds = 1;
+        expired_session.last_accounted_at = now;
+        create_session(
+            &expired_session_id,
+            &expired_session,
+            &format!("mac-{}", expired_session_id),
+            &format!("token-{}", expired_session_id),
+        )
+        .unwrap();
+
+        reserve_vendo_for_customer_session(&vendo.vendo_id, &expired_session_id).unwrap();
+        assert!(
+            get_vendo_reservation_for_vendo(&vendo.vendo_id).unwrap().is_some(),
+            "The reservation must exist before the session expires"
+        );
+
+        let settled = settle_and_get_session(&expired_session_id, now + 2)
+            .unwrap()
+            .expect("Expired session should still be retrievable");
+        assert_eq!(settled.remaining_seconds, 0);
+        assert!(settled.expired_at.is_some());
+        assert!(
+            get_vendo_reservation_for_vendo(&vendo.vendo_id).unwrap().is_none(),
+            "Session expiry must release its vendo reservation"
+        );
+
+        let replacement_session_id = generate_secure_id().unwrap();
+        let mut replacement_session =
+            Session::new("Replacement Reservation Customer".into(), "10.0.0.42".into(), now + 2);
+        replacement_session.remaining_seconds = 120;
+        replacement_session.paused = true;
+        create_session(
+            &replacement_session_id,
+            &replacement_session,
+            &format!("mac-{}", replacement_session_id),
+            &format!("token-{}", replacement_session_id),
+        )
+        .unwrap();
+
+        reserve_vendo_for_customer_session(&vendo.vendo_id, &replacement_session_id)
+            .expect("A different customer must be able to reserve the vendo after expiry");
+
+        let new_reservation = get_vendo_reservation_for_vendo(&vendo.vendo_id)
+            .unwrap()
+            .expect("Replacement reservation must be stored");
+        assert_eq!(new_reservation.session_id, replacement_session_id);
+
+        assert!(release_vendo_reservation_for_session(&replacement_session_id).unwrap());
+        assert!(crate::routes::ws::state::unregister_vendo_connection(
+            &vendo.vendo_id,
+            generation,
+        ));
+    }
+
 }

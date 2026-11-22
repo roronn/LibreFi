@@ -8,7 +8,6 @@ use crate::utils::db::{
     SESSIONS_TABLE,
     Voucher,
     Session,
-    WIFI_GRACE_SECONDS,
 };
 use redb::ReadableDatabase;
 use serde::Deserialize;

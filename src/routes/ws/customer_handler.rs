@@ -7,7 +7,8 @@ use serde_json::{json, Value};
 use tokio::time::{timeout, Duration};
 
 use crate::utils::db::{
-    find_session_by_browser_token, get_session, list_available_vendos,
+    find_session_by_browser_token, get_session, get_vendo,
+    get_vendo_reservation_for_session, list_available_vendos,
     release_vendo_reservation_for_session, reserve_vendo_for_customer_session, Vendo,
 };
 
@@ -61,6 +62,42 @@ fn plan_vendo_discovery(mut available: Vec<Vendo>) -> VendoDiscoveryPlan {
         0 => VendoDiscoveryPlan::NoneAvailable,
         1 => VendoDiscoveryPlan::AutoAssign(available.remove(0)),
         _ => VendoDiscoveryPlan::Choose(available),
+    }
+}
+
+fn existing_vendo_assignment(session_id: &str) -> Result<Option<Value>, String> {
+    let reservation = match get_vendo_reservation_for_session(session_id)? {
+        Some(reservation) => reservation,
+        None => return Ok(None),
+    };
+
+    // A reservation belongs to this authenticated session. Preserve it across
+    // browser reconnects even if the vendo was subsequently disabled or went
+    // offline; an existing reservation is allowed to finish.
+    let vendo = get_vendo(&reservation.vendo_id)?
+        .ok_or_else(|| "Reserved vendo record no longer exists".to_string())?;
+
+    Ok(Some(json!({
+        "type": "VENDO_ASSIGNED",
+        "vendo_id": reservation.vendo_id,
+        "vendo_name": vendo.name,
+    })))
+}
+
+async fn restore_existing_vendo_reservation(
+    socket: &mut WebSocket,
+    session_id: &str,
+) -> Result<bool, ()> {
+    let assignment = existing_vendo_assignment(session_id).map_err(|error| {
+        eprintln!("Failed to restore customer vendo reservation: {}", error);
+    }).map_err(|_| ())?;
+
+    match assignment {
+        Some(message) => {
+            send_json(socket, message).await?;
+            Ok(true)
+        }
+        None => Ok(false),
     }
 }
 
@@ -161,11 +198,19 @@ async fn handle_customer_socket(mut socket: WebSocket) {
         return;
     }
 
-    // One eligible vendo is reserved automatically. Multiple eligible vendos
-    // are offered for explicit selection. An empty list produces no customer
-    // facing "unavailable" message.
-    if send_vendo_options(&mut socket, &session_id).await.is_err() {
-        return;
+    // Restore this session's existing reservation before discovering new
+    // vendos. This prevents a browser reconnect from getting locked out by
+    // its own still-active reservation.
+    match restore_existing_vendo_reservation(&mut socket, &session_id).await {
+        Ok(true) => {}
+        Ok(false) => {
+            // One eligible vendo is reserved automatically. Multiple eligible
+            // vendos are offered for explicit selection. An empty list stays silent.
+            if send_vendo_options(&mut socket, &session_id).await.is_err() {
+                return;
+            }
+        }
+        Err(()) => return,
     }
 
     let (customer_tx, mut customer_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -301,6 +346,52 @@ mod tests {
             enabled: true,
             created_at: 1,
         }
+    }
+
+    #[test]
+    fn customer_reconnect_restores_its_existing_vendo_reservation() {
+        use crate::utils::db::{
+            create_session, init_test_db_once, register_vendo,
+            reserve_vendo_for_customer_session,
+        };
+
+        init_test_db_once();
+
+        let (vendo, _credential) = register_vendo("Reconnect Test Vendo").unwrap();
+        let _generation =
+            crate::routes::ws::state::register_vendo_connection(&vendo.vendo_id);
+
+        let session_id = format!("reconnect-session-{}", vendo.vendo_id);
+        let session = crate::utils::db::Session::new(
+            "Reconnect Test Customer".to_string(),
+            "10.0.0.250".to_string(),
+            crate::utils::db::current_timestamp(),
+        );
+        create_session(
+            &session_id,
+            &session,
+            &format!("mac-{}", vendo.vendo_id),
+            &format!("token-{}", vendo.vendo_id),
+        )
+        .unwrap();
+
+        let reservation =
+            reserve_vendo_for_customer_session(&vendo.vendo_id, &session_id).unwrap();
+
+        let assignment = existing_vendo_assignment(&session_id)
+            .unwrap()
+            .expect("Reconnect should restore the existing reservation");
+
+        assert_eq!(assignment["type"], "VENDO_ASSIGNED");
+        assert_eq!(assignment["vendo_id"], reservation.vendo_id);
+        assert_eq!(assignment["vendo_name"], vendo.name);
+
+        assert!(
+            crate::routes::ws::state::unregister_vendo_connection(
+                &vendo.vendo_id,
+                _generation,
+            )
+        );
     }
 
     #[test]

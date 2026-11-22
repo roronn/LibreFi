@@ -1700,49 +1700,53 @@ pub struct Voucher {
 
 /// Redeem a voucher once, or recover the session linked to an already-used voucher.
 /// Voucher crediting and voucher association are committed in one transaction.
-pub fn redeem_voucher_for_session(
+/// Redeem an unused voucher for the session authenticated by its browser token,
+/// or recover an active session with its original used voucher after the
+/// seven-minute disconnect grace period. MAC addresses are not identity.
+pub fn redeem_voucher_for_customer_session(
     code: &str,
-    mac: &str,
+    browser_token: &str,
 ) -> Result<(String, Session, bool, Option<String>), String> {
+    if browser_token.len() != 64
+        || !browser_token.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err("A valid browser token is required".to_string());
+    }
+
     let db = get_db();
-    let write_txn = db.begin_write().map_err(|e| e.to_string())?;
+    let write_txn = db.begin_write().map_err(|error| error.to_string())?;
     let now = current_timestamp();
 
     let mut voucher: Voucher = {
-        let table = write_txn
+        let vouchers = write_txn
             .open_table(VOUCHERS_TABLE)
-            .map_err(|e| e.to_string())?;
-
-        let value = table
+            .map_err(|error| error.to_string())?;
+        let value = vouchers
             .get(code)
-            .map_err(|e| e.to_string())?
+            .map_err(|error| error.to_string())?
             .ok_or_else(|| "Voucher not found".to_string())?;
-
-        serde_json::from_str(value.value()).map_err(|e| e.to_string())?
+        serde_json::from_str(value.value()).map_err(|error| error.to_string())?
     };
 
-    // A used voucher is a recovery credential, never a second time credit.
     if voucher.used {
         let session_id = voucher
             .session_id
             .clone()
-            .ok_or_else(|| "Voucher was used before session recovery was available".to_string())?;
+            .ok_or_else(|| "Used voucher has no registered session".to_string())?;
 
         let mut session = {
-            let table = write_txn
+            let sessions = write_txn
                 .open_table(SESSIONS_TABLE)
-                .map_err(|e| e.to_string())?;
-
-            let value = table
+                .map_err(|error| error.to_string())?;
+            let value = sessions
                 .get(session_id.as_str())
-                .map_err(|e| e.to_string())?
+                .map_err(|error| error.to_string())?
                 .ok_or_else(|| "Original voucher session not found".to_string())?;
-
-            serde_json::from_str::<Session>(value.value()).map_err(|e| e.to_string())?
+            serde_json::from_str::<Session>(value.value())
+                .map_err(|error| error.to_string())?
         };
 
-        // A used voucher is permanently tied to the customer who first redeemed it.
-        ensure_customer_for_session(&write_txn, session_id.as_str(), &mut session, now)?;
+        ensure_customer_for_session(&write_txn, &session_id, &mut session, now)?;
         let voucher_customer_id = voucher
             .customer_id
             .as_deref()
@@ -1751,220 +1755,203 @@ pub fn redeem_voucher_for_session(
             return Err("Voucher belongs to a different customer".to_string());
         }
 
-        // Settle the original session before deciding whether recovery is allowed.
         session.settle(now);
-
         if session.expired_at.is_some() {
             return Err("Voucher session expired".to_string());
         }
 
-        // Never replace a MAC mapping that now belongs to another session.
+        let disconnected_at = session
+            .disconnected_at
+            .ok_or_else(|| "Voucher recovery is not yet eligible".to_string())?;
+        if session.wifi_connected
+            || now.saturating_sub(disconnected_at) < WIFI_GRACE_SECONDS
         {
-            let mut devices = write_txn
-                .open_table(DEVICE_SESSIONS_TABLE)
-                .map_err(|e| e.to_string())?;
-
-            if let Some(existing) = devices.get(mac).map_err(|e| e.to_string())? {
-                if existing.value() != session_id {
-                    return Err("This device is already linked to another session".to_string());
-                }
-            } else {
-                devices
-                    .insert(mac, session_id.as_str())
-                    .map_err(|e| e.to_string())?;
-            }
+            return Err("Voucher recovery is available after the seven-minute disconnect grace period".to_string());
         }
 
-        let session_json = serde_json::to_string(&session).map_err(|e| e.to_string())?;
+        // The original voucher authorizes one recovery transfer. Revoke every
+        // prior bearer token and device key before issuing access to this browser.
+        crate::utils::customer_identity::revoke_customer_credentials_in_transaction(
+            &write_txn,
+            &session_id,
+        )?;
 
-        {
-            let mut sessions = write_txn
-                .open_table(SESSIONS_TABLE)
-                .map_err(|e| e.to_string())?;
-
-            sessions
-                .insert(session_id.as_str(), session_json.as_str())
-                .map_err(|e| e.to_string())?;
-        }
-
-        write_txn.commit().map_err(|e| e.to_string())?;
-        return Ok((session_id, session, false, None));
-    }
-
-    // An unused voucher can only credit the session currently associated with this MAC.
-    let session_id = {
-        let devices = write_txn
-            .open_table(DEVICE_SESSIONS_TABLE)
-            .map_err(|e| e.to_string())?;
-
-        devices
-            .get(mac)
-            .map_err(|e| e.to_string())?
-            .map(|value| value.value().to_string())
-            .ok_or_else(|| "No session found for this device".to_string())?
-    };
-
-    let mut session = {
-        let table = write_txn
-            .open_table(SESSIONS_TABLE)
-            .map_err(|e| e.to_string())?;
-
-        let value = table
-            .get(session_id.as_str())
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| "Session not found".to_string())?;
-
-        serde_json::from_str::<Session>(value.value()).map_err(|e| e.to_string())?
-    };
-
-    session.settle(now);
-    ensure_customer_for_session(&write_txn, session_id.as_str(), &mut session, now)?;
-
-    let (credited_session_id, credited_session, new_browser_token) = if session.expired_at.is_some()
-    {
-        // Preserve the expired session and start a completely new session.
-        let new_session_id = generate_secure_id()?;
-        let browser_token = generate_browser_token()?;
-        let token_hash = hash_recovery_token(&browser_token);
-
-        let mut new_session = Session::new(session.name.clone(), session.ip.clone(), now);
-        new_session.customer_id = session.customer_id.clone();
-        ensure_customer_for_session(&write_txn, &new_session_id, &mut new_session, now)?;
-        new_session.remaining_seconds = voucher.time as u64;
-        new_session.last_accounted_at = now;
-
-        let old_json = serde_json::to_string(&session).map_err(|e| e.to_string())?;
-        let new_json = serde_json::to_string(&new_session).map_err(|e| e.to_string())?;
-
-        {
-            let mut sessions = write_txn
-                .open_table(SESSIONS_TABLE)
-                .map_err(|e| e.to_string())?;
-
-            if sessions
-                .get(new_session_id.as_str())
-                .map_err(|e| e.to_string())?
-                .is_some()
-            {
-                return Err("Generated session ID already exists".to_string());
-            }
-
-            sessions
-                .insert(session_id.as_str(), old_json.as_str())
-                .map_err(|e| e.to_string())?;
-
-            sessions
-                .insert(new_session_id.as_str(), new_json.as_str())
-                .map_err(|e| e.to_string())?;
-        }
-
-        {
-            let mut devices = write_txn
-                .open_table(DEVICE_SESSIONS_TABLE)
-                .map_err(|e| e.to_string())?;
-
-            devices
-                .insert(mac, new_session_id.as_str())
-                .map_err(|e| e.to_string())?;
-        }
-
+        let new_browser_token = generate_browser_token()?;
+        let token_hash = hash_recovery_token(&new_browser_token);
         {
             let mut tokens = write_txn
                 .open_table(BROWSER_TOKENS_TABLE)
-                .map_err(|e| e.to_string())?;
-
-            if tokens
-                .get(token_hash.as_str())
-                .map_err(|e| e.to_string())?
-                .is_some()
-            {
-                return Err("Generated browser token already exists".to_string());
-            }
-
+                .map_err(|error| error.to_string())?;
             tokens
-                .insert(token_hash.as_str(), new_session_id.as_str())
-                .map_err(|e| e.to_string())?;
+                .insert(token_hash.as_str(), session_id.as_str())
+                .map_err(|error| error.to_string())?;
         }
 
-        (new_session_id, new_session, Some(browser_token))
-    } else {
-        // Active sessions and fresh zero-time sessions are funded in place.
-        session.remaining_seconds = session
-            .remaining_seconds
-            .saturating_add(voucher.time as u64);
-        session.last_accounted_at = now;
-
-        let session_json = serde_json::to_string(&session).map_err(|e| e.to_string())?;
-
+        let session_json = serde_json::to_string(&session).map_err(|error| error.to_string())?;
         {
             let mut sessions = write_txn
                 .open_table(SESSIONS_TABLE)
-                .map_err(|e| e.to_string())?;
-
+                .map_err(|error| error.to_string())?;
             sessions
                 .insert(session_id.as_str(), session_json.as_str())
-                .map_err(|e| e.to_string())?;
+                .map_err(|error| error.to_string())?;
         }
 
-        (session_id.clone(), session, None)
-    };
-
-        // Transfer this customer's vendo reservation to the replacement session.
-    // This update shares the voucher redemption transaction.
-    let matching_reservations = {
-        let reservations = write_txn
-            .open_table(VENDO_RESERVATIONS_TABLE)
-            .map_err(|e| e.to_string())?;
-
-        reservations
-            .iter()
-            .map_err(|e| e.to_string())?
-            .map(|entry| {
-                let (key, value) = entry.map_err(|e| e.to_string())?;
-                let reservation: VendoReservation =
-                    serde_json::from_str(value.value()).map_err(|e| e.to_string())?;
-                Ok((key.value().to_string(), reservation))
-            })
-            .collect::<Result<Vec<_>, String>>()?
-    };
-
-    {
-        let mut reservations = write_txn
-            .open_table(VENDO_RESERVATIONS_TABLE)
-            .map_err(|e| e.to_string())?;
-
-        for (vendo_id, mut reservation) in matching_reservations {
-            if reservation.session_id == session_id && reservation.mac == mac {
-                reservation.session_id = credited_session_id.clone();
-
-                let reservation_json =
-                    serde_json::to_string(&reservation).map_err(|e| e.to_string())?;
-
-                reservations
-                    .insert(vendo_id.as_str(), reservation_json.as_str())
-                    .map_err(|e| e.to_string())?;
-            }
-        }
+        write_txn.commit().map_err(|error| error.to_string())?;
+        return Ok((session_id, session, false, Some(new_browser_token)));
     }
-// Associate the voucher with the session that actually received its time.
+
+    // An unused voucher is claimed only by the browser token already bound
+    // to the customer session. A MAC address cannot claim or select a session.
+    let token_hash = hash_recovery_token(browser_token);
+    let session_id = {
+        let tokens = write_txn
+            .open_table(BROWSER_TOKENS_TABLE)
+            .map_err(|error| error.to_string())?;
+        tokens
+            .get(token_hash.as_str())
+            .map_err(|error| error.to_string())?
+            .map(|value| value.value().to_string())
+            .ok_or_else(|| "Browser token is not recognized".to_string())?
+    };
+
+    let mut session = {
+        let sessions = write_txn
+            .open_table(SESSIONS_TABLE)
+            .map_err(|error| error.to_string())?;
+        let value = sessions
+            .get(session_id.as_str())
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "Customer session not found".to_string())?;
+        serde_json::from_str::<Session>(value.value()).map_err(|error| error.to_string())?
+    };
+
+    session.settle(now);
+    ensure_customer_for_session(&write_txn, &session_id, &mut session, now)?;
+
+    let (credited_session_id, credited_session, new_browser_token) =
+        if session.expired_at.is_some() {
+            let new_session_id = generate_secure_id()?;
+            let new_browser_token = generate_browser_token()?;
+            let new_token_hash = hash_recovery_token(&new_browser_token);
+
+            let mut new_session = Session::new(session.name.clone(), session.ip.clone(), now);
+            new_session.customer_id = session.customer_id.clone();
+            ensure_customer_for_session(
+                &write_txn,
+                &new_session_id,
+                &mut new_session,
+                now,
+            )?;
+            new_session.remaining_seconds = voucher.time as u64;
+            new_session.last_accounted_at = now;
+
+            // A replacement session invalidates all old browser and device keys.
+            crate::utils::customer_identity::revoke_customer_credentials_in_transaction(
+                &write_txn,
+                &session_id,
+            )?;
+
+            let old_json = serde_json::to_string(&session).map_err(|error| error.to_string())?;
+            let new_json =
+                serde_json::to_string(&new_session).map_err(|error| error.to_string())?;
+            {
+                let mut sessions = write_txn
+                    .open_table(SESSIONS_TABLE)
+                    .map_err(|error| error.to_string())?;
+                sessions
+                    .insert(session_id.as_str(), old_json.as_str())
+                    .map_err(|error| error.to_string())?;
+                sessions
+                    .insert(new_session_id.as_str(), new_json.as_str())
+                    .map_err(|error| error.to_string())?;
+            }
+
+            {
+                let mut tokens = write_txn
+                    .open_table(BROWSER_TOKENS_TABLE)
+                    .map_err(|error| error.to_string())?;
+                tokens
+                    .insert(new_token_hash.as_str(), new_session_id.as_str())
+                    .map_err(|error| error.to_string())?;
+            }
+
+            // Move an existing coin-vendo reservation with the customer's
+            // session identity; it is not tied to a physical MAC address.
+            let matching_reservations = {
+                let reservations = write_txn
+                    .open_table(VENDO_RESERVATIONS_TABLE)
+                    .map_err(|error| error.to_string())?;
+                reservations
+                    .iter()
+                    .map_err(|error| error.to_string())?
+                    .map(|entry| {
+                        let (key, value) = entry.map_err(|error| error.to_string())?;
+                        let reservation: VendoReservation =
+                            serde_json::from_str(value.value())
+                                .map_err(|error| error.to_string())?;
+                        Ok(if reservation.session_id == session_id {
+                            Some((key.value().to_string(), reservation))
+                        } else {
+                            None
+                        })
+                    })
+                    .collect::<Result<Vec<_>, String>>()?
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>()
+            };
+            {
+                let mut reservations = write_txn
+                    .open_table(VENDO_RESERVATIONS_TABLE)
+                    .map_err(|error| error.to_string())?;
+                for (vendo_id, mut reservation) in matching_reservations {
+                    reservation.session_id = new_session_id.clone();
+                    let reservation_json =
+                        serde_json::to_string(&reservation).map_err(|error| error.to_string())?;
+                    reservations
+                        .insert(vendo_id.as_str(), reservation_json.as_str())
+                        .map_err(|error| error.to_string())?;
+                }
+            }
+
+            (new_session_id, new_session, Some(new_browser_token))
+        } else {
+            session.remaining_seconds = session
+                .remaining_seconds
+                .saturating_add(voucher.time as u64);
+            session.last_accounted_at = now;
+
+            let session_json =
+                serde_json::to_string(&session).map_err(|error| error.to_string())?;
+            {
+                let mut sessions = write_txn
+                    .open_table(SESSIONS_TABLE)
+                    .map_err(|error| error.to_string())?;
+                sessions
+                    .insert(session_id.as_str(), session_json.as_str())
+                    .map_err(|error| error.to_string())?;
+            }
+
+            (session_id.clone(), session, None)
+        };
+
     voucher.used = true;
     voucher.customer_id = credited_session.customer_id.clone();
     voucher.session_id = Some(credited_session_id.clone());
     voucher.redeemed_at = Some(now);
 
-    let voucher_json = serde_json::to_string(&voucher).map_err(|e| e.to_string())?;
-
+    let voucher_json = serde_json::to_string(&voucher).map_err(|error| error.to_string())?;
     {
         let mut vouchers = write_txn
             .open_table(VOUCHERS_TABLE)
-            .map_err(|e| e.to_string())?;
-
+            .map_err(|error| error.to_string())?;
         vouchers
             .insert(code, voucher_json.as_str())
-            .map_err(|e| e.to_string())?;
+            .map_err(|error| error.to_string())?;
     }
 
-    write_txn.commit().map_err(|e| e.to_string())?;
+    write_txn.commit().map_err(|error| error.to_string())?;
 
     Ok((
         credited_session_id,
@@ -1973,6 +1960,7 @@ pub fn redeem_voucher_for_session(
         new_browser_token,
     ))
 }
+
 #[cfg(test)]
 mod session_logic_tests {
     use super::*;

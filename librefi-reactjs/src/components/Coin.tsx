@@ -252,6 +252,16 @@ function Coin({ children, onClose }: { children: ReactElement, onClose?: () => v
                     let seconds = data.time || 0;
 
                     if (
+                        typeof data.recovery_voucher === "string" &&
+                        /^[a-f0-9]{4}(?:-[a-f0-9]{4}){4}$/i.test(data.recovery_voucher)
+                    ) {
+                        localStorage.setItem("librefi_last_voucher", data.recovery_voucher);
+                        setLastVoucher(data.recovery_voucher);
+                        setRecoveryStatus(true);
+                        setIsCheckingRecovery(false);
+                    }
+
+                    if (
                         typeof data.browser_token === "string" &&
                         /^[0-9a-fA-F]{64}$/.test(data.browser_token)
                     ) {

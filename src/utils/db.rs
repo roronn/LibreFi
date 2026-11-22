@@ -2107,6 +2107,10 @@ mod session_logic_tests {
 
         let (vendo_one, vendo_one_credential) = register_vendo("Payment Test Vendo One").unwrap();
 
+        // Reservation requires an authenticated online vendo connection.
+        let vendo_connection_generation =
+            crate::routes::ws::state::register_vendo_connection(&vendo_one.vendo_id);
+
         // Registration stores the SHA-256 verifier, not the raw credential.
         let initial_verifier = get_vendo_auth_verifier(&vendo_one.vendo_id)
             .unwrap()
@@ -2308,6 +2312,13 @@ mod session_logic_tests {
             get_vendo_auth_verifier(&vendo_one.vendo_id)
                 .unwrap()
                 .is_none()
+        );
+
+        assert!(
+            crate::routes::ws::state::unregister_vendo_connection(
+                &vendo_one.vendo_id,
+                vendo_connection_generation,
+            )
         );
 
         // A second vendo starts its own independent sequence at 1.

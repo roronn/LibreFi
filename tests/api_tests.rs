@@ -7,7 +7,7 @@ use rand::RngCore;
 use serde_json::json;
 
 const BASE_URL: &str = "http://127.0.0.1:8080";
-const ADMIN_KEY: &str = "arns_super_pogi_4ever";
+fn admin_key() -> String { std::env::var("LIBREFI_KEY").expect("LIBREFI_KEY must be set when running API tests") }
 
 fn encrypt_payload(key_str: &str, payload: serde_json::Value) -> String {
     let mut key_bytes = [0u8; 32];
@@ -40,14 +40,14 @@ fn query_string(payload: &str) -> String {
 
 #[test]
 fn test_get_dashboard() {
-    let payload = encrypt_payload(ADMIN_KEY, json!({"id": 1}));
+    let payload = encrypt_payload(&admin_key(), json!({"id": 1}));
     let url = format!(
         "{}/api/admin/dashboard?payload={}",
         BASE_URL,
         query_string(&payload)
     );
     let response = ureq::get(&url).call();
-    assert!(response.is_ok(), "Failed to reach dashboard endpoint");
+    assert!(response.is_ok(), "Failed to reach dashboard endpoint: {:?}", response.err());
     assert_eq!(response.unwrap().status(), 200);
 }
 
@@ -55,7 +55,7 @@ fn test_get_dashboard() {
 fn test_rates_crud() {
     // 1. POST Rate
     let post_payload = encrypt_payload(
-        ADMIN_KEY,
+        &admin_key(),
         json!({
             "price": 10.0,
             "time": 3600
@@ -63,10 +63,10 @@ fn test_rates_crud() {
     );
     let url = format!("{}/api/admin/rates", BASE_URL);
     let post_res = ureq::post(&url).send_json(json!({"payload": post_payload}));
-    assert!(post_res.is_ok(), "Failed to POST rate");
+    assert!(post_res.is_ok(), "Failed to POST rate: {:?}", post_res.err());
 
     // 2. GET Rates
-    let get_payload = encrypt_payload(ADMIN_KEY, json!({"id": 1}));
+    let get_payload = encrypt_payload(&admin_key(), json!({"id": 1}));
     let get_url = format!(
         "{}/api/admin/rates?payload={}",
         BASE_URL,
@@ -79,7 +79,7 @@ fn test_rates_crud() {
 
     // 3. PUT Rate (update a dummy rate just to check endpoint response)
     let put_payload = encrypt_payload(
-        ADMIN_KEY,
+        &admin_key(),
         json!({
             "id": "dummy_id",
             "price": 20.0,
@@ -89,27 +89,27 @@ fn test_rates_crud() {
     let _put_res = ureq::put(&url).send_json(json!({"payload": put_payload})); // Might return 404 or 400, but endpoint is hit
 
     // 4. DELETE Rate
-    let del_payload = encrypt_payload(ADMIN_KEY, json!({"id": "dummy_id"}));
+    let del_payload = encrypt_payload(&admin_key(), json!({"id": "dummy_id"}));
     let _del_res = ureq::delete(&url).send_json(json!({"payload": del_payload}));
 }
 
 #[test]
 fn test_get_users() {
-    let payload = encrypt_payload(ADMIN_KEY, json!({"id": 1}));
+    let payload = encrypt_payload(&admin_key(), json!({"id": 1}));
     let url = format!(
         "{}/api/admin/users?payload={}",
         BASE_URL,
         query_string(&payload)
     );
     let response = ureq::get(&url).call();
-    assert!(response.is_ok(), "Failed to GET users");
+    assert!(response.is_ok(), "Failed to GET users: {:?}", response.err());
     assert_eq!(response.unwrap().status(), 200);
 }
 
 #[test]
 fn test_post_qos() {
     let payload = encrypt_payload(
-        ADMIN_KEY,
+        &admin_key(),
         json!({
             "download": 10.0,
             "upload": 5.0,
@@ -124,7 +124,7 @@ fn test_post_qos() {
 #[test]
 fn test_post_wifi() {
     let payload = encrypt_payload(
-        ADMIN_KEY,
+        &admin_key(),
         json!({
             "ssid_2g": "TestWiFi_2G",
             "key_2g": "testpassword",
@@ -141,7 +141,7 @@ fn test_post_wifi() {
 #[test]
 fn test_vouchers() {
     // 1. GET Vouchers
-    let payload = encrypt_payload(ADMIN_KEY, json!({"id": 1}));
+    let payload = encrypt_payload(&admin_key(), json!({"id": 1}));
     let url = format!(
         "{}/api/admin/vouchers?payload={}",
         BASE_URL,
@@ -151,7 +151,7 @@ fn test_vouchers() {
 
     // 2. POST Vouchers (Generate)
     let post_payload = encrypt_payload(
-        ADMIN_KEY,
+        &admin_key(),
         json!({
             "count": 1,
             "time": 3600
@@ -163,7 +163,7 @@ fn test_vouchers() {
 
 #[test]
 fn test_post_coinslot_key() {
-    let payload = encrypt_payload(ADMIN_KEY, json!({"id": 1}));
+    let payload = encrypt_payload(&admin_key(), json!({"id": 1}));
     let url = format!("{}/api/admin/coinslot/key", BASE_URL);
     let _response = ureq::post(&url).send_json(json!({"payload": payload}));
 }

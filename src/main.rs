@@ -13,7 +13,6 @@ use crate::routes::{
     play_pause::play_pause,
     rates::rates,
     redeem::redeem,
-    ws::ws_handler,
 };
 
 fn main() {
@@ -102,7 +101,6 @@ fn main() {
     rates(&mut server);
     redeem(&mut server);
     coin(&mut server);
-    server.ws("/ws", ws_handler);
-
+    // Temporarily disabled during Axum migration; restore in the WebSocket stage.
     server.run();
 }

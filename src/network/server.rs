@@ -1,9 +1,19 @@
+use axum::{
+    body::{to_bytes, Body},
+    extract::{ConnectInfo, State},
+    http::{HeaderName, HeaderValue, Request as HttpRequest, StatusCode},
+    response::Response as AxumResponse,
+    routing::{any, get},
+    Router,
+};
 use redb::ReadableDatabase;
 use rust_embed::RustEmbed;
-use std::collections::HashMap;
-use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::Arc;
-use tiny_http::{Header, ReadWrite, Response as TinyResponse, Server as TinyServer};
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    panic::{AssertUnwindSafe, catch_unwind},
+    sync::Arc,
+};
 
 #[derive(RustEmbed)]
 #[folder = "dist"]
@@ -22,354 +32,393 @@ pub struct Response {
     pub headers: HashMap<String, String>,
 }
 
-type Handler = Box<dyn Fn(&Request, &mut Response)>;
-pub type WsHandler =
-    Arc<dyn Fn(tungstenite::WebSocket<Box<dyn ReadWrite + Send>>, String) + Send + Sync>;
+type Handler = Arc<dyn Fn(&Request, &mut Response) + Send + Sync>;
 
-pub struct Server {
-    pub port: u16,
-    listener: TinyServer,
+struct RouteTable {
     get_routes: HashMap<String, Handler>,
     post_routes: HashMap<String, Handler>,
     put_routes: HashMap<String, Handler>,
     delete_routes: HashMap<String, Handler>,
-    ws_routes: HashMap<String, WsHandler>,
+}
+
+pub struct Server {
+    pub port: u16,
+    get_routes: HashMap<String, Handler>,
+    post_routes: HashMap<String, Handler>,
+    put_routes: HashMap<String, Handler>,
+    delete_routes: HashMap<String, Handler>,
 }
 
 impl Server {
     pub fn new(port: u16) -> Self {
-        let addr = format!("0.0.0.0:{}", port);
-        let listener = TinyServer::http(&addr).unwrap();
-
         Server {
             port,
-            listener,
             get_routes: HashMap::new(),
             post_routes: HashMap::new(),
             put_routes: HashMap::new(),
             delete_routes: HashMap::new(),
-            ws_routes: HashMap::new(),
         }
     }
 
     pub fn get<F>(&mut self, path: &str, handler: F)
     where
-        F: Fn(&Request, &mut Response) + 'static,
+        F: Fn(&Request, &mut Response) + Send + Sync + 'static,
     {
-        self.get_routes.insert(path.to_string(), Box::new(handler));
-    }
-
-    pub fn ws<F>(&mut self, path: &str, handler: F)
-    where
-        F: Fn(tungstenite::WebSocket<Box<dyn ReadWrite + Send>>, String) + Send + Sync + 'static,
-    {
-        self.ws_routes.insert(path.to_string(), Arc::new(handler));
+        self.get_routes.insert(path.to_string(), Arc::new(handler));
     }
 
     pub fn post<F>(&mut self, path: &str, handler: F)
     where
-        F: Fn(&Request, &mut Response) + 'static,
+        F: Fn(&Request, &mut Response) + Send + Sync + 'static,
     {
-        self.post_routes.insert(path.to_string(), Box::new(handler));
+        self.post_routes.insert(path.to_string(), Arc::new(handler));
     }
 
     pub fn put<F>(&mut self, path: &str, handler: F)
     where
-        F: Fn(&Request, &mut Response) + 'static,
+        F: Fn(&Request, &mut Response) + Send + Sync + 'static,
     {
-        self.put_routes.insert(path.to_string(), Box::new(handler));
+        self.put_routes.insert(path.to_string(), Arc::new(handler));
     }
 
     pub fn delete<F>(&mut self, path: &str, handler: F)
     where
-        F: Fn(&Request, &mut Response) + 'static,
+        F: Fn(&Request, &mut Response) + Send + Sync + 'static,
     {
-        self.delete_routes
-            .insert(path.to_string(), Box::new(handler));
+        self.delete_routes.insert(path.to_string(), Arc::new(handler));
     }
 
     pub fn run(&self) {
-        println!("Server running on port {}", self.port);
+        let port = self.port;
 
-        for mut real_request in self.listener.incoming_requests() {
-            let raw_url = real_request.url().to_string();
+        let routes = Arc::new(RouteTable {
+            get_routes: self.get_routes.clone(),
+            post_routes: self.post_routes.clone(),
+            put_routes: self.put_routes.clone(),
+            delete_routes: self.delete_routes.clone(),
+        });
 
-            let mut parts = raw_url.splitn(2, '?');
-            let mut path = parts.next().unwrap_or("/").to_string();
-            let query = parts.next().unwrap_or("").to_string();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("Failed to create Tokio runtime");
 
-            if path.len() > 1 && path.ends_with('/') {
-                path.pop();
+        runtime.block_on(async move {
+            let address = SocketAddr::from(([0, 0, 0, 0], port));
+
+            let listener = tokio::net::TcpListener::bind(address)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("Failed to bind HTTP server on {}: {}", address, error)
+                });
+
+            println!("Axum server running on port {}", port);
+
+            let app = Router::new()
+                .route("/ws", get(crate::routes::ws::axum_handler::axum_ws_handler))
+                .fallback(any(dispatch))
+                .with_state(routes);
+
+            if let Err(error) = axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            {
+                eprintln!("HTTP server error: {}", error);
             }
+        });
+    }
+}
 
-            let method = format!("{:?}", real_request.method()).to_lowercase();
+async fn dispatch(
+    State(routes): State<Arc<RouteTable>>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    request: HttpRequest<Body>,
+) -> AxumResponse {
+    let method = request.method().clone();
+    let raw_path = request.uri().path().to_string();
+    let query = request.uri().query().unwrap_or("").to_string();
 
-            crate::debug_println!(
-                "-> Received {} request for: '{}' (mapped to '{}')",
-                method.to_uppercase(),
-                raw_url,
-                path
+    let mut path = raw_path.clone();
+
+    if path.len() > 1 && path.ends_with('/') {
+        path.pop();
+    }
+
+    let ip = remote.ip().to_string();
+
+    let headers: HashMap<String, String> = request
+        .headers()
+        .iter()
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|value| (name.as_str().to_lowercase(), value.to_string()))
+        })
+        .collect();
+
+    crate::debug_println!(
+        "-> Received {} request for: '{}' (mapped to '{}')",
+        method,
+        raw_path,
+        path
+    );
+
+    let body = match to_bytes(request.into_body(), 16 * 1024 * 1024).await {
+        Ok(body) => body.to_vec(),
+        Err(_) => {
+            return simple_response(
+                StatusCode::BAD_REQUEST,
+                b"400 - Invalid request body".to_vec(),
             );
+        }
+    };
 
-            let mut headers = HashMap::new();
-            for header in real_request.headers() {
-                headers.insert(
-                    header.field.as_str().to_string().to_lowercase(),
-                    header.value.as_str().to_string(),
-                );
-            }
+    let result = tokio::task::spawn_blocking(move || {
+        handle_request(
+            &routes,
+            &method.to_string().to_lowercase(),
+            &path,
+            &query,
+            &ip,
+            body,
+            &headers,
+        )
+    })
+    .await;
 
-            let ip = real_request
-                .remote_addr()
-                .map(|addr| addr.ip().to_string())
-                .unwrap_or_else(|| String::from("unknown"));
-
-            let is_websocket_upgrade = headers
-                .get("upgrade")
-                .map(|v| v.to_lowercase() == "websocket")
-                .unwrap_or(false);
-
-            if method == "get" && is_websocket_upgrade {
-                if let Some(handler) = self.ws_routes.get(&path) {
-                    if let Some(key) = headers.get("sec-websocket-key") {
-                        let accept_key = tungstenite::handshake::derive_accept_key(key.as_bytes());
-                        let response = TinyResponse::empty(101)
-                            .with_header(
-                                Header::from_bytes(&b"Upgrade"[..], &b"websocket"[..]).unwrap(),
-                            )
-                            .with_header(
-                                Header::from_bytes(&b"Connection"[..], &b"Upgrade"[..]).unwrap(),
-                            )
-                            .with_header(
-                                Header::from_bytes(
-                                    &b"Sec-WebSocket-Accept"[..],
-                                    accept_key.as_bytes(),
-                                )
-                                .unwrap(),
-                            );
-
-                        let stream = real_request.upgrade("websocket", response);
-                        let ws = tungstenite::WebSocket::from_raw_socket(
-                            stream,
-                            tungstenite::protocol::Role::Server,
-                            None,
-                        );
-                        let client_ip = ip.clone();
-                        let handler = Arc::clone(handler);
-                        std::thread::spawn(move || {
-                            handler(ws, client_ip);
-                        });
-                        continue;
-                    }
-                }
-            }
-
-            let mut body = Vec::new();
-            let _ = real_request.as_reader().read_to_end(&mut body);
-
-            let req = Request {
-                body,
-                ip: ip.clone(),
-                query: query.clone(),
-            };
-
-            let mut res = Response {
-                status: 404,
-                body: b"404 - Your father Not Found".to_vec(),
-                content_type: String::from("text/plain"),
-                headers: HashMap::new(),
-            };
-
-            if method == "get" {
-                if let Some(handler) = self.get_routes.get(&path) {
-                    if catch_unwind(AssertUnwindSafe(|| handler(&req, &mut res))).is_err() {
-                        res.status = 500;
-                        res.body = b"500 - Internal Server Error".to_vec();
-                    }
-                } else {
-                    let mut safe_path = path.trim_start_matches('/').replace("..", "");
-
-                    if safe_path.is_empty() {
-                        safe_path = String::from("index.html");
-                    }
-
-                    let supports_gzip = headers
-                        .get("accept-encoding")
-                        .map(|v| v.to_lowercase().contains("gzip"))
-                        .unwrap_or(false);
-
-                    let get_asset = |p: &str| -> Option<(Vec<u8>, bool)> {
-                        if supports_gzip {
-                            if let Some(f) = Asset::get(&format!("{}.gz", p)) {
-                                return Some((f.data.into_owned(), true));
-                            }
-                        }
-
-                        if let Some(f) = Asset::get(p) {
-                            return Some((f.data.into_owned(), false));
-                        }
-                        None
-                    };
-
-                    let mut contents_res = get_asset(&safe_path).ok_or(());
-
-                    let mut is_cpd = false;
-                    for cp_path in [
-                        "/hotspot-detect.html",
-                        "/generate_204",
-                        "/gen_204",
-                        "/ncsi.txt",
-                        "/connecttest.txt",
-                        "/success.txt",
-                        "/canonical.html",
-                        "/library/test/success.html",
-                    ] {
-                        if path.contains(cp_path) {
-                            is_cpd = true;
-                            break;
-                        }
-                    }
-
-                    let mut has_access = false;
-                    if let Some(mac) = crate::utils::get_mac_from_ip::get_mac_from_ip(&req.ip) {
-                        let db = crate::utils::db::get_db();
-                        if let Ok(read_txn) = db.begin_read() {
-                            if let Ok(table) = read_txn.open_table(crate::utils::db::USERS_TABLE) {
-                                if let Ok(Some(record)) = table.get(mac.as_str()) {
-                                    if let Ok(user) = serde_json::from_str::<crate::utils::db::User>(
-                                        record.value(),
-                                    ) {
-                                        let now = std::time::SystemTime::now()
-                                            .duration_since(std::time::UNIX_EPOCH)
-                                            .unwrap()
-                                            .as_secs()
-                                            as u32;
-                                        if user.expires_on > now && !user.paused {
-                                            has_access = true;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    let mut handled_cpd = false;
-                    if is_cpd && has_access {
-                        handled_cpd = true;
-                        if path.contains("hotspot-detect.html") || path.contains("success.html") {
-                            res.status = 200;
-                            res.body = b"<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY></HTML>".to_vec();
-                            res.content_type = String::from("text/html");
-                        } else if path.contains("success.txt") {
-                            res.status = 200;
-                            res.body = b"success\n".to_vec();
-                            res.content_type = String::from("text/plain");
-                        } else {
-                            res.status = 204;
-                            res.body = Vec::new();
-                        }
-                    } else if is_cpd && !has_access {
-                        handled_cpd = true;
-                        res.status = 302;
-                        res.headers
-                            .insert("Location".to_string(), "http://10.0.0.1/".to_string());
-                        res.body = b"Found".to_vec();
-                    } else if contents_res.is_err() {
-                        safe_path = String::from("index.html");
-                        contents_res = get_asset(&safe_path).ok_or(());
-                    }
-
-                    if !handled_cpd {
-                        if let Ok((contents, is_gz)) = contents_res {
-                            res.status = 200;
-                            res.body = contents;
-
-                            if safe_path.ends_with(".html") {
-                                res.content_type = String::from("text/html");
-                            } else if safe_path.ends_with(".css") {
-                                res.content_type = String::from("text/css");
-                            } else if safe_path.ends_with(".js") {
-                                res.content_type = String::from("application/javascript");
-                            } else if safe_path.ends_with(".json") {
-                                res.content_type = String::from("application/json");
-                            } else if safe_path.ends_with(".svg") {
-                                res.content_type = String::from("image/svg+xml");
-                            } else if safe_path.ends_with(".woff2") {
-                                res.content_type = String::from("font/woff2");
-                            }
-
-                            if is_gz {
-                                res.headers
-                                    .insert("Content-Encoding".to_string(), "gzip".to_string());
-                            }
-                        } else {
-                            res.status = 404;
-                            res.body = b"404 - index.html not found!".to_vec();
-                            res.content_type = String::from("text/plain");
-                        }
-                    }
-                }
-            } else if method == "post" {
-                if let Some(handler) = self.post_routes.get(&path) {
-                    if catch_unwind(AssertUnwindSafe(|| handler(&req, &mut res))).is_err() {
-                        res.status = 500;
-                        res.body = b"500 - Internal Server Error".to_vec();
-                    }
-                } else {
-                    crate::debug_println!("   [!] No POST route found for '{}'", path);
-                }
-            } else if method == "put" {
-                if let Some(handler) = self.put_routes.get(&path) {
-                    if catch_unwind(AssertUnwindSafe(|| handler(&req, &mut res))).is_err() {
-                        res.status = 500;
-                        res.body = b"500 - Internal Server Error".to_vec();
-                    }
-                } else {
-                    crate::debug_println!("   [!] No PUT route found for '{}'", path);
-                }
-            } else if method == "delete" {
-                if let Some(handler) = self.delete_routes.get(&path) {
-                    if catch_unwind(AssertUnwindSafe(|| handler(&req, &mut res))).is_err() {
-                        res.status = 500;
-                        res.body = b"500 - Internal Server Error".to_vec();
-                    }
-                } else {
-                    crate::debug_println!("   [!] No DELETE route found for '{}'", path);
-                }
-            } else if method == "options" {
-                res.status = 204;
-                res.body = Vec::new();
-            }
-
-            let content_type_header =
-                Header::from_bytes(&b"Content-Type"[..], res.content_type.as_bytes()).unwrap();
-            let cors_origin =
-                Header::from_bytes(&b"Access-Control-Allow-Origin"[..], &b"*"[..]).unwrap();
-            let cors_methods = Header::from_bytes(
-                &b"Access-Control-Allow-Methods"[..],
-                &b"GET, POST, PUT, DELETE, OPTIONS"[..],
+    match result {
+        Ok(response) => build_response(response),
+        Err(error) => {
+            eprintln!("HTTP request task failed: {}", error);
+            simple_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                b"500 - Internal Server Error".to_vec(),
             )
-            .unwrap();
-            let cors_headers = Header::from_bytes(
-                &b"Access-Control-Allow-Headers"[..],
-                &b"Content-Type, Authorization"[..],
-            )
-            .unwrap();
-
-            let mut tiny_res = TinyResponse::from_data(res.body)
-                .with_status_code(res.status)
-                .with_header(content_type_header)
-                .with_header(cors_origin)
-                .with_header(cors_methods)
-                .with_header(cors_headers);
-
-            for (k, v) in res.headers {
-                if let Ok(header) = Header::from_bytes(k.as_bytes(), v.as_bytes()) {
-                    tiny_res = tiny_res.with_header(header);
-                }
-            }
-
-            let _ = real_request.respond(tiny_res);
         }
     }
+}
+
+fn handle_request(
+    routes: &RouteTable,
+    method: &str,
+    path: &str,
+    query: &str,
+    ip: &str,
+    body: Vec<u8>,
+    headers: &HashMap<String, String>,
+) -> Response {
+    let req = Request {
+        body,
+        ip: ip.to_string(),
+        query: query.to_string(),
+    };
+
+    let mut res = Response {
+        status: 404,
+        body: b"404 - Your father Not Found".to_vec(),
+        content_type: "text/plain".to_string(),
+        headers: HashMap::new(),
+    };
+
+    let route = match method {
+        "get" => routes.get_routes.get(path),
+        "post" => routes.post_routes.get(path),
+        "put" => routes.put_routes.get(path),
+        "delete" => routes.delete_routes.get(path),
+        _ => None,
+    };
+
+    if let Some(handler) = route {
+        if catch_unwind(AssertUnwindSafe(|| handler(&req, &mut res))).is_err() {
+            res.status = 500;
+            res.body = b"500 - Internal Server Error".to_vec();
+            res.content_type = "text/plain".to_string();
+        }
+
+        return res;
+    }
+
+    if method == "options" {
+        res.status = 204;
+        res.body.clear();
+        return res;
+    }
+
+    if method != "get" {
+        return res;
+    }
+
+    let mut safe_path = path.trim_start_matches('/').replace("..", "");
+
+    if safe_path.is_empty() {
+        safe_path = "index.html".to_string();
+    }
+
+    let supports_gzip = headers
+        .get("accept-encoding")
+        .map(|value| value.to_lowercase().contains("gzip"))
+        .unwrap_or(false);
+
+    let get_asset = |asset_path: &str| -> Option<(Vec<u8>, bool)> {
+        if supports_gzip {
+            if let Some(file) = Asset::get(&format!("{}.gz", asset_path)) {
+                return Some((file.data.into_owned(), true));
+            }
+        }
+
+        Asset::get(asset_path).map(|file| (file.data.into_owned(), false))
+    };
+
+    let mut contents_res = get_asset(&safe_path);
+
+    let captive_paths = [
+        "/hotspot-detect.html",
+        "/generate_204",
+        "/gen_204",
+        "/ncsi.txt",
+        "/connecttest.txt",
+        "/success.txt",
+        "/canonical.html",
+        "/library/test/success.html",
+    ];
+
+    let is_cpd = captive_paths.iter().any(|cp_path| path.contains(cp_path));
+
+    let mut has_access = false;
+
+    if let Some(mac) = crate::utils::get_mac_from_ip::get_mac_from_ip(&req.ip) {
+        let db = crate::utils::db::get_db();
+
+        if let Ok(read_txn) = db.begin_read() {
+            if let Ok(table) = read_txn.open_table(crate::utils::db::USERS_TABLE) {
+                if let Ok(Some(record)) = table.get(mac.as_str()) {
+                    if let Ok(user) =
+                        serde_json::from_str::<crate::utils::db::User>(record.value())
+                    {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_secs() as u32;
+
+                        if user.expires_on > now && !user.paused {
+                            has_access = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut handled_cpd = false;
+
+    if is_cpd && has_access {
+        handled_cpd = true;
+
+        if path.contains("hotspot-detect.html") || path.contains("success.html") {
+            res.status = 200;
+            res.body =
+                b"<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY></HTML>"
+                    .to_vec();
+            res.content_type = "text/html".to_string();
+        } else if path.contains("success.txt") {
+            res.status = 200;
+            res.body = b"success\n".to_vec();
+            res.content_type = "text/plain".to_string();
+        } else {
+            res.status = 204;
+            res.body.clear();
+        }
+    } else if is_cpd && !has_access {
+        handled_cpd = true;
+        res.status = 302;
+        res.headers.insert(
+            "Location".to_string(),
+            "http://10.0.0.1/".to_string(),
+        );
+        res.body = b"Found".to_vec();
+    } else if contents_res.is_none() {
+        safe_path = "index.html".to_string();
+        contents_res = get_asset(&safe_path);
+    }
+
+    if !handled_cpd {
+        if let Some((contents, is_gz)) = contents_res {
+            res.status = 200;
+            res.body = contents;
+
+            if safe_path.ends_with(".html") {
+                res.content_type = "text/html".to_string();
+            } else if safe_path.ends_with(".css") {
+                res.content_type = "text/css".to_string();
+            } else if safe_path.ends_with(".js") {
+                res.content_type = "application/javascript".to_string();
+            } else if safe_path.ends_with(".json") {
+                res.content_type = "application/json".to_string();
+            } else if safe_path.ends_with(".svg") {
+                res.content_type = "image/svg+xml".to_string();
+            } else if safe_path.ends_with(".woff2") {
+                res.content_type = "font/woff2".to_string();
+            }
+
+            if is_gz {
+                res.headers.insert(
+                    "Content-Encoding".to_string(),
+                    "gzip".to_string(),
+                );
+            }
+        } else {
+            res.status = 404;
+            res.body = b"404 - index.html not found!".to_vec();
+            res.content_type = "text/plain".to_string();
+        }
+    }
+
+    res
+}
+
+fn build_response(response: Response) -> AxumResponse {
+    let status = StatusCode::from_u16(response.status)
+        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+
+    let mut builder = AxumResponse::builder()
+        .status(status)
+        .header("Content-Type", response.content_type)
+        .header("Access-Control-Allow-Origin", "*")
+        .header(
+            "Access-Control-Allow-Methods",
+            "GET, POST, PUT, DELETE, OPTIONS",
+        )
+        .header(
+            "Access-Control-Allow-Headers",
+            "Content-Type, Authorization",
+        );
+
+    for (name, value) in response.headers {
+        if let (Ok(name), Ok(value)) = (
+            HeaderName::from_bytes(name.as_bytes()),
+            HeaderValue::from_str(&value),
+        ) {
+            builder = builder.header(name, value);
+        }
+    }
+
+    builder
+        .body(Body::from(response.body))
+        .unwrap_or_else(|_| {
+            simple_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                b"500 - Internal Server Error".to_vec(),
+            )
+        })
+}
+
+fn simple_response(status: StatusCode, body: Vec<u8>) -> AxumResponse {
+    AxumResponse::builder()
+        .status(status)
+        .header("Content-Type", "text/plain")
+        .body(Body::from(body))
+        .unwrap()
 }

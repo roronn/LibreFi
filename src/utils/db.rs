@@ -1,4 +1,4 @@
-﻿use rand::RngCore;
+use rand::RngCore;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -67,9 +67,7 @@ impl Session {
         let previous_remaining = self.remaining_seconds;
 
         if elapsed >= previous_remaining {
-            self.expired_at = Some(
-                self.last_accounted_at.saturating_add(previous_remaining)
-            );
+            self.expired_at = Some(self.last_accounted_at.saturating_add(previous_remaining));
         }
 
         self.remaining_seconds = previous_remaining.saturating_sub(elapsed);
@@ -119,6 +117,69 @@ impl Session {
     }
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct Vendo {
+    pub vendo_id: String,
+    pub name: String,
+    pub enabled: bool,
+    pub created_at: u64,
+}
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct VendoReservation {
+    pub vendo_id: String,
+    pub session_id: String,
+    pub mac: String,
+    pub reserved_at: u64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct VendoCredential {
+    pub vendo_id: String,
+    pub credential_hash: String,
+    pub created_at: u64,
+    pub revoked_at: Option<u64>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct VendoTransaction {
+    pub vendo_id: String,
+    pub event_id: String,
+    pub sequence: u64,
+    pub amount: u32,
+    pub pulse_count: u32,
+    pub device_timestamp: u64,
+    pub received_at: u64,
+    pub status: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct VendoSequence {
+    pub vendo_id: String,
+    pub sequence: u64,
+    pub event_id: String,
+    pub received_at: u64,
+}
+#[derive(Debug, Clone)]
+pub struct VendoPaymentEvent {
+    pub vendo_id: String,
+    pub event_id: String,
+    pub sequence: u64,
+    pub amount: u32,
+    pub pulse_count: u32,
+    pub device_timestamp: u64,
+}
+
+#[derive(Debug, Clone)]
+pub enum VendoPaymentResult {
+    Credited {
+        session_id: String,
+        session: Session,
+        browser_token: Option<String>,
+    },
+    Duplicate {
+        original_event_id: String,
+    },
+}
 pub static DB: OnceLock<Database> = OnceLock::new();
 
 pub const USERS_TABLE: TableDefinition<&str, &str> = TableDefinition::new("users");
@@ -127,12 +188,25 @@ pub const VOUCHERS_TABLE: TableDefinition<&str, &str> = TableDefinition::new("vo
 pub const CONFIG_TABLE: TableDefinition<&str, &str> = TableDefinition::new("config");
 pub const SALES_TABLE: TableDefinition<u32, u32> = TableDefinition::new("sales");
 
-pub const SESSIONS_TABLE: TableDefinition<&str, &str> =
-    TableDefinition::new("sessions");
+pub const SESSIONS_TABLE: TableDefinition<&str, &str> = TableDefinition::new("sessions");
 pub const DEVICE_SESSIONS_TABLE: TableDefinition<&str, &str> =
     TableDefinition::new("device_sessions");
 pub const BROWSER_TOKENS_TABLE: TableDefinition<&str, &str> =
     TableDefinition::new("browser_tokens");
+
+// Multi-vendo registry and payment tables
+pub const VENDOS_TABLE: TableDefinition<&str, &str> = TableDefinition::new("vendos");
+
+pub const VENDO_CREDENTIALS_TABLE: TableDefinition<&str, &str> =
+    TableDefinition::new("vendo_credentials");
+
+pub const VENDO_TRANSACTIONS_TABLE: TableDefinition<&str, &str> =
+    TableDefinition::new("vendo_transactions");
+
+pub const VENDO_SEQUENCES_TABLE: TableDefinition<&str, &str> =
+    TableDefinition::new("vendo_sequences");
+pub const VENDO_RESERVATIONS_TABLE: TableDefinition<&str, &str> =
+    TableDefinition::new("vendo_reservations");
 
 pub fn init_db(db_path: &str) {
     if let Some(parent) = std::path::Path::new(db_path).parent() {
@@ -152,10 +226,30 @@ pub fn init_db(db_path: &str) {
         let _ = write_txn.open_table(SESSIONS_TABLE).unwrap();
         let _ = write_txn.open_table(DEVICE_SESSIONS_TABLE).unwrap();
         let _ = write_txn.open_table(BROWSER_TOKENS_TABLE).unwrap();
+
+        // Multi-vendo tables
+        let _ = write_txn.open_table(VENDOS_TABLE).unwrap();
+        let _ = write_txn.open_table(VENDO_CREDENTIALS_TABLE).unwrap();
+        let _ = write_txn.open_table(VENDO_TRANSACTIONS_TABLE).unwrap();
+        let _ = write_txn.open_table(VENDO_SEQUENCES_TABLE).unwrap();
+        let _ = write_txn.open_table(VENDO_RESERVATIONS_TABLE).unwrap();
     }
     write_txn.commit().unwrap();
 
     DB.set(db).expect("Database was already initialized");
+}
+
+#[cfg(test)]
+pub(crate) fn init_test_db_once() {
+    static TEST_DB_INIT: OnceLock<()> = OnceLock::new();
+
+    TEST_DB_INIT.get_or_init(|| {
+        let db_path = std::env::temp_dir().join(format!(
+            "librefi-tests-{}.redb",
+            generate_secure_id().expect("Failed to generate test database ID")
+        ));
+        init_db(db_path.to_str().expect("Invalid test database path"));
+    });
 }
 
 pub fn get_db() -> &'static Database {
@@ -196,6 +290,86 @@ pub fn hash_recovery_token(token: &str) -> String {
     }
     output
 }
+// Register a vendo and generate its individual device credential.
+// The raw credential is returned once and is never stored in the database.
+pub fn register_vendo(name: &str) -> Result<(Vendo, String), String> {
+    let name = name.trim();
+
+    if name.is_empty() || name.chars().count() > 64 {
+        return Err("Vendo name must contain between 1 and 64 characters".to_string());
+    }
+
+    if name.chars().any(|character| character.is_control()) {
+        return Err("Vendo name contains invalid characters".to_string());
+    }
+
+    let vendo_id = generate_secure_id()?;
+    let device_credential = generate_secure_id()?;
+    let credential_hash = hash_recovery_token(&device_credential);
+    let now = current_timestamp();
+
+    let vendo = Vendo {
+        vendo_id: vendo_id.clone(),
+        name: name.to_string(),
+        enabled: true,
+        created_at: now,
+    };
+
+    let credential_record = VendoCredential {
+        vendo_id: vendo_id.clone(),
+        credential_hash,
+        created_at: now,
+        revoked_at: None,
+    };
+
+    let vendo_json = serde_json::to_string(&vendo).map_err(|error| error.to_string())?;
+
+    let credential_json =
+        serde_json::to_string(&credential_record).map_err(|error| error.to_string())?;
+
+    let db = get_db();
+    let write_txn = db.begin_write().map_err(|error| error.to_string())?;
+
+    {
+        let mut vendos = write_txn
+            .open_table(VENDOS_TABLE)
+            .map_err(|error| error.to_string())?;
+
+        if vendos
+            .get(vendo_id.as_str())
+            .map_err(|error| error.to_string())?
+            .is_some()
+        {
+            return Err("Generated vendo ID already exists".to_string());
+        }
+
+        vendos
+            .insert(vendo_id.as_str(), vendo_json.as_str())
+            .map_err(|error| error.to_string())?;
+    }
+
+    {
+        let mut credentials = write_txn
+            .open_table(VENDO_CREDENTIALS_TABLE)
+            .map_err(|error| error.to_string())?;
+
+        if credentials
+            .get(vendo_id.as_str())
+            .map_err(|error| error.to_string())?
+            .is_some()
+        {
+            return Err("Vendo credential already exists".to_string());
+        }
+
+        credentials
+            .insert(vendo_id.as_str(), credential_json.as_str())
+            .map_err(|error| error.to_string())?;
+    }
+
+    write_txn.commit().map_err(|error| error.to_string())?;
+
+    Ok((vendo, device_credential))
+}
 
 pub fn create_session(
     session_id: &str,
@@ -235,9 +409,7 @@ pub fn create_session(
             return Err("Device is already linked to a session".to_string());
         }
 
-        devices
-            .insert(mac, session_id)
-            .map_err(|e| e.to_string())?;
+        devices.insert(mac, session_id).map_err(|e| e.to_string())?;
     }
 
     {
@@ -259,6 +431,429 @@ pub fn create_session(
     }
 
     write_txn.commit().map_err(|e| e.to_string())
+}
+fn constant_time_string_eq(left: &str, right: &str) -> bool {
+    let left_bytes = left.as_bytes();
+    let right_bytes = right.as_bytes();
+
+    if left_bytes.len() != right_bytes.len() {
+        return false;
+    }
+
+    let difference = left_bytes
+        .iter()
+        .zip(right_bytes.iter())
+        .fold(0u8, |diff, (a, b)| diff | (a ^ b));
+
+    difference == 0
+}
+
+pub fn revoke_vendo_credential(vendo_id: &str) -> Result<(), String> {
+    let db = get_db();
+    let write_txn = db.begin_write().map_err(|e| e.to_string())?;
+
+    let mut credentials = write_txn
+        .open_table(VENDO_CREDENTIALS_TABLE)
+        .map_err(|e| e.to_string())?;
+
+    let mut record: VendoCredential = match credentials.get(vendo_id).map_err(|e| e.to_string())? {
+        Some(value) => serde_json::from_str(value.value()).map_err(|e| e.to_string())?,
+        None => return Err("Vendo credential not found".to_string()),
+    };
+
+    if record.revoked_at.is_none() {
+        record.revoked_at = Some(current_timestamp());
+
+        let record_json = serde_json::to_string(&record).map_err(|e| e.to_string())?;
+
+        credentials
+            .insert(vendo_id, record_json.as_str())
+            .map_err(|e| e.to_string())?;
+    }
+
+    drop(credentials);
+
+    write_txn.commit().map_err(|e| e.to_string())
+}
+pub fn rotate_vendo_credential(vendo_id: &str) -> Result<String, String> {
+    let new_credential = generate_secure_id()?;
+    let credential_hash = hash_recovery_token(&new_credential);
+    let now = current_timestamp();
+
+    let db = get_db();
+    let write_txn = db.begin_write().map_err(|e| e.to_string())?;
+
+    let mut credentials = write_txn
+        .open_table(VENDO_CREDENTIALS_TABLE)
+        .map_err(|e| e.to_string())?;
+
+    let existing: VendoCredential = match credentials.get(vendo_id).map_err(|e| e.to_string())? {
+        Some(value) => serde_json::from_str(value.value()).map_err(|e| e.to_string())?,
+        None => return Err("Vendo credential not found".to_string()),
+    };
+
+    let replacement = VendoCredential {
+        vendo_id: existing.vendo_id,
+        credential_hash,
+        created_at: now,
+        revoked_at: None,
+    };
+
+    let replacement_json = serde_json::to_string(&replacement).map_err(|e| e.to_string())?;
+
+    credentials
+        .insert(vendo_id, replacement_json.as_str())
+        .map_err(|e| e.to_string())?;
+
+    drop(credentials);
+
+    write_txn.commit().map_err(|e| e.to_string())?;
+
+    Ok(new_credential)
+}
+pub fn get_vendo_auth_verifier(vendo_id: &str) -> Result<Option<[u8; 32]>, String> {
+    let db = get_db();
+    let read_txn = db.begin_read().map_err(|e| e.to_string())?;
+
+    let credential_record = {
+        let table = read_txn
+            .open_table(VENDO_CREDENTIALS_TABLE)
+            .map_err(|e| e.to_string())?;
+
+        match table.get(vendo_id).map_err(|e| e.to_string())? {
+            Some(value) => {
+                serde_json::from_str::<VendoCredential>(value.value()).map_err(|e| e.to_string())?
+            }
+            None => return Ok(None),
+        }
+    };
+
+    if credential_record.vendo_id != vendo_id || credential_record.revoked_at.is_some() {
+        return Ok(None);
+    }
+
+    let vendo = {
+        let table = read_txn
+            .open_table(VENDOS_TABLE)
+            .map_err(|e| e.to_string())?;
+
+        match table.get(vendo_id).map_err(|e| e.to_string())? {
+            Some(value) => {
+                serde_json::from_str::<Vendo>(value.value()).map_err(|e| e.to_string())?
+            }
+            None => return Ok(None),
+        }
+    };
+
+    if vendo.vendo_id != vendo_id {
+        return Ok(None);
+    }
+
+    let hash = credential_record.credential_hash.as_bytes();
+
+    if hash.len() != 64 {
+        return Err("Stored vendo credential hash has an invalid length".to_string());
+    }
+
+    let mut verifier = [0u8; 32];
+
+    for (index, chunk) in hash.chunks_exact(2).enumerate() {
+        let hex = std::str::from_utf8(chunk)
+            .map_err(|_| "Stored vendo credential hash is not valid hexadecimal".to_string())?;
+
+        verifier[index] = u8::from_str_radix(hex, 16)
+            .map_err(|_| "Stored vendo credential hash is not valid hexadecimal".to_string())?;
+    }
+
+    Ok(Some(verifier))
+}
+pub fn authenticate_vendo(vendo_id: &str, credential: &str) -> Result<Option<Vendo>, String> {
+    let db = get_db();
+    let read_txn = db.begin_read().map_err(|e| e.to_string())?;
+
+    let credential_record = {
+        let table = read_txn
+            .open_table(VENDO_CREDENTIALS_TABLE)
+            .map_err(|e| e.to_string())?;
+
+        match table.get(vendo_id).map_err(|e| e.to_string())? {
+            Some(value) => {
+                serde_json::from_str::<VendoCredential>(value.value()).map_err(|e| e.to_string())?
+            }
+            None => return Ok(None),
+        }
+    };
+
+    if credential_record.revoked_at.is_some() {
+        return Ok(None);
+    }
+
+    let supplied_hash = hash_recovery_token(credential);
+
+    if !constant_time_string_eq(&supplied_hash, &credential_record.credential_hash) {
+        return Ok(None);
+    }
+
+    let table = read_txn
+        .open_table(VENDOS_TABLE)
+        .map_err(|e| e.to_string())?;
+
+    match table.get(vendo_id).map_err(|e| e.to_string())? {
+        Some(value) => {
+            let vendo: Vendo = serde_json::from_str(value.value()).map_err(|e| e.to_string())?;
+
+            if vendo.vendo_id != credential_record.vendo_id {
+                return Ok(None);
+            }
+
+            Ok(Some(vendo))
+        }
+        None => Ok(None),
+    }
+}
+pub fn get_vendo(vendo_id: &str) -> Result<Option<Vendo>, String> {
+    let db = get_db();
+    let read_txn = db.begin_read().map_err(|e| e.to_string())?;
+    let table = read_txn
+        .open_table(VENDOS_TABLE)
+        .map_err(|e| e.to_string())?;
+
+    match table.get(vendo_id).map_err(|e| e.to_string())? {
+        Some(value) => serde_json::from_str(value.value())
+            .map(Some)
+            .map_err(|e| e.to_string()),
+        None => Ok(None),
+    }
+}
+
+pub fn list_vendos() -> Result<Vec<Vendo>, String> {
+    let db = get_db();
+    let read_txn = db.begin_read().map_err(|e| e.to_string())?;
+    let table = read_txn
+        .open_table(VENDOS_TABLE)
+        .map_err(|e| e.to_string())?;
+
+    let mut vendos = Vec::new();
+
+    for entry in table.iter().map_err(|e| e.to_string())? {
+        let (_, value) = entry.map_err(|e| e.to_string())?;
+        let vendo: Vendo = serde_json::from_str(value.value()).map_err(|e| e.to_string())?;
+        vendos.push(vendo);
+    }
+
+    Ok(vendos)
+}
+pub fn list_available_vendos() -> Result<Vec<Vendo>, String> {
+    let online_ids = crate::routes::ws::state::list_online_vendo_ids();
+
+    let db = get_db();
+    let read_txn = db.begin_read().map_err(|e| e.to_string())?;
+
+    let vendos_table = read_txn
+        .open_table(VENDOS_TABLE)
+        .map_err(|e| e.to_string())?;
+
+    let reservations_table = read_txn
+        .open_table(VENDO_RESERVATIONS_TABLE)
+        .map_err(|e| e.to_string())?;
+
+    let mut available = Vec::new();
+
+    for entry in vendos_table.iter().map_err(|e| e.to_string())? {
+        let (key, value) = entry.map_err(|e| e.to_string())?;
+        let vendo: Vendo =
+            serde_json::from_str(value.value()).map_err(|e| e.to_string())?;
+
+        if !vendo.enabled || !online_ids.contains(&vendo.vendo_id) {
+            continue;
+        }
+
+        if reservations_table
+            .get(key.value())
+            .map_err(|e| e.to_string())?
+            .is_some()
+        {
+            continue;
+        }
+
+        available.push(vendo);
+    }
+
+    Ok(available)
+}
+pub fn reserve_vendo_for_session(
+    vendo_id: &str,
+    session_id: &str,
+    mac: &str,
+) -> Result<VendoReservation, String> {
+    let result = crate::routes::ws::state::with_vendo_online(vendo_id, || {
+        let db = get_db();
+        let write_txn = db.begin_write().map_err(|e| e.to_string())?;
+
+        {
+            let vendos = write_txn
+                .open_table(VENDOS_TABLE)
+                .map_err(|e| e.to_string())?;
+
+            let vendo: Vendo = match vendos
+                .get(vendo_id)
+                .map_err(|e| e.to_string())?
+            {
+                Some(value) => serde_json::from_str(value.value())
+                    .map_err(|e| e.to_string())?,
+                None => return Err("Vendo not found".to_string()),
+            };
+
+            if !vendo.enabled {
+                return Err("Vendo is disabled".to_string());
+            }
+        }
+
+        {
+            let devices = write_txn
+                .open_table(DEVICE_SESSIONS_TABLE)
+                .map_err(|e| e.to_string())?;
+
+            match devices.get(mac).map_err(|e| e.to_string())? {
+                Some(value) if value.value() == session_id => {}
+                _ => return Err("Customer session does not belong to this device".to_string()),
+            }
+        }
+
+        {
+            let sessions = write_txn
+                .open_table(SESSIONS_TABLE)
+                .map_err(|e| e.to_string())?;
+
+            if sessions
+                .get(session_id)
+                .map_err(|e| e.to_string())?
+                .is_none()
+            {
+                return Err("Customer session not found".to_string());
+            }
+        }
+
+        let reservation = VendoReservation {
+            vendo_id: vendo_id.to_string(),
+            session_id: session_id.to_string(),
+            mac: mac.to_string(),
+            reserved_at: current_timestamp(),
+        };
+
+        {
+            let mut reservations = write_txn
+                .open_table(VENDO_RESERVATIONS_TABLE)
+                .map_err(|e| e.to_string())?;
+
+            if reservations
+                .get(vendo_id)
+                .map_err(|e| e.to_string())?
+                .is_some()
+            {
+                return Err("Vendo is already reserved".to_string());
+            }
+
+            let reservation_json =
+                serde_json::to_string(&reservation).map_err(|e| e.to_string())?;
+
+            reservations
+                .insert(vendo_id, reservation_json.as_str())
+                .map_err(|e| e.to_string())?;
+        }
+
+        write_txn.commit().map_err(|e| e.to_string())?;
+
+        Ok(reservation)
+    });
+
+    match result {
+        Some(result) => result,
+        None => Err("Vendo is offline".to_string()),
+    }
+}
+pub fn set_vendo_enabled(vendo_id: &str, enabled: bool) -> Result<Vendo, String> {
+    let db = get_db();
+    let write_txn = db.begin_write().map_err(|e| e.to_string())?;
+
+    let mut vendos = write_txn
+        .open_table(VENDOS_TABLE)
+        .map_err(|e| e.to_string())?;
+
+    let mut vendo: Vendo = match vendos.get(vendo_id).map_err(|e| e.to_string())? {
+        Some(value) => serde_json::from_str(value.value()).map_err(|e| e.to_string())?,
+        None => return Err("Vendo not found".to_string()),
+    };
+
+    vendo.enabled = enabled;
+
+    let vendo_json = serde_json::to_string(&vendo).map_err(|e| e.to_string())?;
+
+    vendos
+        .insert(vendo_id, vendo_json.as_str())
+        .map_err(|e| e.to_string())?;
+
+    drop(vendos);
+
+    write_txn.commit().map_err(|e| e.to_string())?;
+
+    Ok(vendo)
+}
+pub fn release_vendo_reservation(
+    session_id: &str,
+    mac: &str,
+) -> Result<bool, String> {
+    let db = get_db();
+    let write_txn = db.begin_write().map_err(|e| e.to_string())?;
+
+    let mut reservations = write_txn
+        .open_table(VENDO_RESERVATIONS_TABLE)
+        .map_err(|e| e.to_string())?;
+
+    let mut matching_vendo_ids = Vec::new();
+
+    for entry in reservations.iter().map_err(|e| e.to_string())? {
+        let (key, value) = entry.map_err(|e| e.to_string())?;
+        let reservation: VendoReservation =
+            serde_json::from_str(value.value()).map_err(|e| e.to_string())?;
+
+        if reservation.session_id == session_id && reservation.mac == mac {
+            matching_vendo_ids.push(key.value().to_string());
+        }
+    }
+
+    for vendo_id in &matching_vendo_ids {
+        reservations
+            .remove(vendo_id.as_str())
+            .map_err(|e| e.to_string())?;
+    }
+
+    drop(reservations);
+
+    write_txn.commit().map_err(|e| e.to_string())?;
+
+    Ok(!matching_vendo_ids.is_empty())
+}
+pub fn get_vendo_reservation_for_session(
+    session_id: &str,
+) -> Result<Option<VendoReservation>, String> {
+    let db = get_db();
+    let read_txn = db.begin_read().map_err(|e| e.to_string())?;
+    let reservations = read_txn
+        .open_table(VENDO_RESERVATIONS_TABLE)
+        .map_err(|e| e.to_string())?;
+
+    for entry in reservations.iter().map_err(|e| e.to_string())? {
+        let (_, value) = entry.map_err(|e| e.to_string())?;
+        let reservation: VendoReservation =
+            serde_json::from_str(value.value()).map_err(|e| e.to_string())?;
+
+        if reservation.session_id == session_id {
+            return Ok(Some(reservation));
+        }
+    }
+
+    Ok(None)
 }
 pub fn get_session(session_id: &str) -> Result<Option<Session>, String> {
     let db = get_db();
@@ -330,10 +925,7 @@ pub fn link_device_and_browser_to_session(
             .open_table(BROWSER_TOKENS_TABLE)
             .map_err(|e| e.to_string())?;
 
-        if let Some(existing) = tokens
-            .get(token_hash.as_str())
-            .map_err(|e| e.to_string())?
-        {
+        if let Some(existing) = tokens.get(token_hash.as_str()).map_err(|e| e.to_string())? {
             if existing.value() != session_id {
                 return Err("Browser token already belongs to another session".to_string());
             }
@@ -349,26 +941,18 @@ pub fn link_device_and_browser_to_session(
             .open_table(DEVICE_SESSIONS_TABLE)
             .map_err(|e| e.to_string())?;
 
-        if let Some(existing) = devices
-            .get(mac)
-            .map_err(|e| e.to_string())?
-        {
+        if let Some(existing) = devices.get(mac).map_err(|e| e.to_string())? {
             if existing.value() != session_id {
                 return Err("Device is already linked to another session".to_string());
             }
         }
 
-        devices
-            .insert(mac, session_id)
-            .map_err(|e| e.to_string())?;
+        devices.insert(mac, session_id).map_err(|e| e.to_string())?;
     }
 
     write_txn.commit().map_err(|e| e.to_string())
 }
-pub fn settle_and_get_session(
-    session_id: &str,
-    now: u64,
-) -> Result<Option<Session>, String> {
+pub fn settle_and_get_session(session_id: &str, now: u64) -> Result<Option<Session>, String> {
     let db = get_db();
     let write_txn = db.begin_write().map_err(|e| e.to_string())?;
 
@@ -379,8 +963,7 @@ pub fn settle_and_get_session(
 
         match table.get(session_id).map_err(|e| e.to_string())? {
             Some(value) => {
-                serde_json::from_str::<Session>(value.value())
-                    .map_err(|e| e.to_string())?
+                serde_json::from_str::<Session>(value.value()).map_err(|e| e.to_string())?
             }
             None => return Ok(None),
         }
@@ -388,8 +971,7 @@ pub fn settle_and_get_session(
 
     session.settle(now);
 
-    let session_json =
-        serde_json::to_string(&session).map_err(|e| e.to_string())?;
+    let session_json = serde_json::to_string(&session).map_err(|e| e.to_string())?;
 
     {
         let mut table = write_txn
@@ -401,6 +983,44 @@ pub fn settle_and_get_session(
             .map_err(|e| e.to_string())?;
     }
 
+    // Release reservations belonging to an expired session.
+    if session.remaining_seconds == 0 {
+        let matching_vendo_ids = {
+            let reservations = write_txn
+                .open_table(VENDO_RESERVATIONS_TABLE)
+                .map_err(|e| e.to_string())?;
+
+            reservations
+                .iter()
+                .map_err(|e| e.to_string())?
+                .map(|entry| {
+                    let (key, value) = entry.map_err(|e| e.to_string())?;
+                    let reservation: VendoReservation =
+                        serde_json::from_str(value.value())
+                            .map_err(|e| e.to_string())?;
+
+                    Ok(if reservation.session_id == session_id {
+                        Some(key.value().to_string())
+                    } else {
+                        None
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()?
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+        };
+
+        let mut reservations = write_txn
+            .open_table(VENDO_RESERVATIONS_TABLE)
+            .map_err(|e| e.to_string())?;
+
+        for vendo_id in &matching_vendo_ids {
+            reservations
+                .remove(vendo_id.as_str())
+                .map_err(|e| e.to_string())?;
+        }
+    }
     write_txn.commit().map_err(|e| e.to_string())?;
 
     Ok(Some(session))
@@ -413,6 +1033,27 @@ pub fn credit_session_for_payment(
 ) -> Result<(String, Session, Option<String>), String> {
     let db = get_db();
     let write_txn = db.begin_write().map_err(|e| e.to_string())?;
+
+    let result = credit_session_for_payment_in_transaction(
+        &write_txn,
+        session_id,
+        mac,
+        seconds,
+        sale_amount,
+    )?;
+
+    write_txn.commit().map_err(|e| e.to_string())?;
+
+    Ok(result)
+}
+
+fn credit_session_for_payment_in_transaction(
+    write_txn: &redb::WriteTransaction,
+    session_id: &str,
+    mac: &str,
+    seconds: u64,
+    sale_amount: Option<u32>,
+) -> Result<(String, Session, Option<String>), String> {
     let now = current_timestamp();
 
     // Abort if this MAC was reassigned before the payment transaction.
@@ -435,8 +1076,7 @@ pub fn credit_session_for_payment(
 
         match table.get(session_id).map_err(|e| e.to_string())? {
             Some(value) => {
-                serde_json::from_str::<Session>(value.value())
-                    .map_err(|e| e.to_string())?
+                serde_json::from_str::<Session>(value.value()).map_err(|e| e.to_string())?
             }
             None => return Err("Session not found".to_string()),
         }
@@ -444,97 +1084,87 @@ pub fn credit_session_for_payment(
 
     session.settle(now);
 
-    let (result_id, result_session, new_browser_token) =
-        if session.expired_at.is_some() {
-            let new_session_id = generate_secure_id()?;
-            let browser_token = generate_browser_token()?;
-            let token_hash = hash_recovery_token(&browser_token);
+    let (result_id, result_session, new_browser_token) = if session.expired_at.is_some() {
+        let new_session_id = generate_secure_id()?;
+        let browser_token = generate_browser_token()?;
+        let token_hash = hash_recovery_token(&browser_token);
 
-            let mut new_session =
-                Session::new(session.name.clone(), session.ip.clone(), now);
-            new_session.remaining_seconds = seconds;
-            new_session.last_accounted_at = now;
+        let mut new_session = Session::new(session.name.clone(), session.ip.clone(), now);
+        new_session.remaining_seconds = seconds;
+        new_session.last_accounted_at = now;
 
-            let old_json =
-                serde_json::to_string(&session).map_err(|e| e.to_string())?;
-            let new_json =
-                serde_json::to_string(&new_session).map_err(|e| e.to_string())?;
+        let old_json = serde_json::to_string(&session).map_err(|e| e.to_string())?;
+        let new_json = serde_json::to_string(&new_session).map_err(|e| e.to_string())?;
 
+        {
+            let mut sessions = write_txn
+                .open_table(SESSIONS_TABLE)
+                .map_err(|e| e.to_string())?;
+
+            if sessions
+                .get(new_session_id.as_str())
+                .map_err(|e| e.to_string())?
+                .is_some()
             {
-                let mut sessions = write_txn
-                    .open_table(SESSIONS_TABLE)
-                    .map_err(|e| e.to_string())?;
-
-                if sessions
-                    .get(new_session_id.as_str())
-                    .map_err(|e| e.to_string())?
-                    .is_some()
-                {
-                    return Err("Generated session ID already exists".to_string());
-                }
-
-                sessions
-                    .insert(session_id, old_json.as_str())
-                    .map_err(|e| e.to_string())?;
-
-                sessions
-                    .insert(new_session_id.as_str(), new_json.as_str())
-                    .map_err(|e| e.to_string())?;
+                return Err("Generated session ID already exists".to_string());
             }
 
-            {
-                let mut devices = write_txn
-                    .open_table(DEVICE_SESSIONS_TABLE)
-                    .map_err(|e| e.to_string())?;
+            sessions
+                .insert(session_id, old_json.as_str())
+                .map_err(|e| e.to_string())?;
 
-                devices
-                    .insert(mac, new_session_id.as_str())
-                    .map_err(|e| e.to_string())?;
+            sessions
+                .insert(new_session_id.as_str(), new_json.as_str())
+                .map_err(|e| e.to_string())?;
+        }
+
+        {
+            let mut devices = write_txn
+                .open_table(DEVICE_SESSIONS_TABLE)
+                .map_err(|e| e.to_string())?;
+
+            devices
+                .insert(mac, new_session_id.as_str())
+                .map_err(|e| e.to_string())?;
+        }
+
+        {
+            let mut tokens = write_txn
+                .open_table(BROWSER_TOKENS_TABLE)
+                .map_err(|e| e.to_string())?;
+
+            if tokens
+                .get(token_hash.as_str())
+                .map_err(|e| e.to_string())?
+                .is_some()
+            {
+                return Err("Generated browser token already exists".to_string());
             }
 
-            {
-                let mut tokens = write_txn
-                    .open_table(BROWSER_TOKENS_TABLE)
-                    .map_err(|e| e.to_string())?;
+            tokens
+                .insert(token_hash.as_str(), new_session_id.as_str())
+                .map_err(|e| e.to_string())?;
+        }
 
-                if tokens
-                    .get(token_hash.as_str())
-                    .map_err(|e| e.to_string())?
-                    .is_some()
-                {
-                    return Err("Generated browser token already exists".to_string());
-                }
+        (new_session_id, new_session, Some(browser_token))
+    } else {
+        session.remaining_seconds = session.remaining_seconds.saturating_add(seconds);
+        session.last_accounted_at = now;
 
-                tokens
-                    .insert(token_hash.as_str(), new_session_id.as_str())
-                    .map_err(|e| e.to_string())?;
-            }
+        let session_json = serde_json::to_string(&session).map_err(|e| e.to_string())?;
 
-            (
-                new_session_id,
-                new_session,
-                Some(browser_token),
-            )
-        } else {
-            session.remaining_seconds =
-                session.remaining_seconds.saturating_add(seconds);
-            session.last_accounted_at = now;
+        {
+            let mut sessions = write_txn
+                .open_table(SESSIONS_TABLE)
+                .map_err(|e| e.to_string())?;
 
-            let session_json =
-                serde_json::to_string(&session).map_err(|e| e.to_string())?;
+            sessions
+                .insert(session_id, session_json.as_str())
+                .map_err(|e| e.to_string())?;
+        }
 
-            {
-                let mut sessions = write_txn
-                    .open_table(SESSIONS_TABLE)
-                    .map_err(|e| e.to_string())?;
-
-                sessions
-                    .insert(session_id, session_json.as_str())
-                    .map_err(|e| e.to_string())?;
-            }
-
-            (session_id.to_string(), session, None)
-        };
+        (session_id.to_string(), session, None)
+    };
 
     if let Some(amount) = sale_amount {
         let local_time = now + 8 * 3600;
@@ -555,10 +1185,231 @@ pub fn credit_session_for_payment(
             .map_err(|e| e.to_string())?;
     }
 
-    write_txn.commit().map_err(|e| e.to_string())?;
-
     Ok((result_id, result_session, new_browser_token))
 }
+/// Atomically records and credits one vendo payment event.
+/// Duplicate events never credit session time or sales twice.
+pub fn credit_vendo_payment(
+    session_id: &str,
+    mac: &str,
+    seconds: u64,
+    event: VendoPaymentEvent,
+) -> Result<VendoPaymentResult, String> {
+    if event.vendo_id.trim().is_empty()
+        || event.vendo_id.len() > 128
+        || event.vendo_id.chars().any(|c| c.is_control())
+    {
+        return Err("Invalid vendo ID".to_string());
+    }
+
+    if event.event_id.trim().is_empty()
+        || event.event_id.len() > 128
+        || event.event_id.chars().any(|c| c.is_control())
+    {
+        return Err("Invalid payment event ID".to_string());
+    }
+
+    if event.sequence == 0 {
+        return Err("Payment sequence must be greater than zero".to_string());
+    }
+
+    if event.amount == 0 || event.pulse_count == 0 || seconds == 0 {
+        return Err(
+            "Payment amount, pulse count, and credited time must be greater than zero".to_string(),
+        );
+    }
+
+    let db = get_db();
+    let write_txn = db.begin_write().map_err(|e| e.to_string())?;
+
+    // Confirm that this vendo exists. Administrative enabled status is
+    // intentionally not checked: an existing reservation may finish.
+    {
+        let vendos = write_txn
+            .open_table(VENDOS_TABLE)
+            .map_err(|e| e.to_string())?;
+
+        let vendo: Vendo = match vendos
+            .get(event.vendo_id.as_str())
+            .map_err(|e| e.to_string())?
+        {
+            Some(value) => serde_json::from_str(value.value()).map_err(|e| e.to_string())?,
+            None => return Err("Vendo not found".to_string()),
+        };
+
+        if vendo.vendo_id != event.vendo_id {
+            return Err("Vendo record ID mismatch".to_string());
+        }
+    }
+
+    // Length-prefix the vendo ID to avoid ambiguous composite keys.
+    let transaction_key = format!(
+        "{}:{}{}",
+        event.vendo_id.len(),
+        event.vendo_id,
+        event.event_id
+    );
+
+    // Check duplicate event IDs before checking sequence numbers.
+    {
+        let transactions = write_txn
+            .open_table(VENDO_TRANSACTIONS_TABLE)
+            .map_err(|e| e.to_string())?;
+
+        if let Some(value) = transactions
+            .get(transaction_key.as_str())
+            .map_err(|e| e.to_string())?
+        {
+            let existing: VendoTransaction =
+                serde_json::from_str(value.value()).map_err(|e| e.to_string())?;
+
+            if existing.vendo_id == event.vendo_id
+                && existing.event_id == event.event_id
+                && existing.sequence == event.sequence
+                && existing.amount == event.amount
+                && existing.pulse_count == event.pulse_count
+                && existing.device_timestamp == event.device_timestamp
+            {
+                return Ok(VendoPaymentResult::Duplicate {
+                    original_event_id: existing.event_id,
+                });
+            }
+
+            return Err("Payment event ID was reused with different payment details".to_string());
+        }
+    }
+
+    // The payment must belong to the vendo currently reserved by this session.
+    {
+        let reservations = write_txn
+            .open_table(VENDO_RESERVATIONS_TABLE)
+            .map_err(|e| e.to_string())?;
+
+        let reservation: VendoReservation = match reservations
+            .get(event.vendo_id.as_str())
+            .map_err(|e| e.to_string())?
+        {
+            Some(value) => serde_json::from_str(value.value())
+                .map_err(|e| e.to_string())?,
+            None => return Err("Vendo has no active reservation".to_string()),
+        };
+
+        if reservation.vendo_id != event.vendo_id
+            || reservation.session_id != session_id
+            || reservation.mac != mac
+        {
+            return Err("Vendo reservation does not belong to this session".to_string());
+        }
+    }
+    // Enforce strictly sequential events for each vendo.
+    {
+        let sequences = write_txn
+            .open_table(VENDO_SEQUENCES_TABLE)
+            .map_err(|e| e.to_string())?;
+
+        let expected_sequence = match sequences
+            .get(event.vendo_id.as_str())
+            .map_err(|e| e.to_string())?
+        {
+            Some(value) => {
+                let previous: VendoSequence =
+                    serde_json::from_str(value.value()).map_err(|e| e.to_string())?;
+
+                if previous.vendo_id != event.vendo_id {
+                    return Err("Vendo sequence record ID mismatch".to_string());
+                }
+
+                previous
+                    .sequence
+                    .checked_add(1)
+                    .ok_or_else(|| "Vendo sequence number exhausted".to_string())?
+            }
+            None => 1,
+        };
+
+        if event.sequence != expected_sequence {
+            return Err(format!(
+                "Invalid payment sequence: expected {}, received {}",
+                expected_sequence, event.sequence
+            ));
+        }
+    }
+
+    // Credit the existing or replacement session using the shared helper.
+    // Any later failure rolls back these changes with the same transaction.
+    let (credited_session_id, credited_session, browser_token) =
+        credit_session_for_payment_in_transaction(
+            &write_txn,
+            session_id,
+            mac,
+            seconds,
+            Some(event.amount),
+        )?;
+
+    let received_at = current_timestamp();
+
+    let transaction = VendoTransaction {
+        vendo_id: event.vendo_id.clone(),
+        event_id: event.event_id.clone(),
+        sequence: event.sequence,
+        amount: event.amount,
+        pulse_count: event.pulse_count,
+        device_timestamp: event.device_timestamp,
+        received_at,
+        status: "credited".to_string(),
+    };
+
+    let transaction_json = serde_json::to_string(&transaction).map_err(|e| e.to_string())?;
+
+    {
+        let mut transactions = write_txn
+            .open_table(VENDO_TRANSACTIONS_TABLE)
+            .map_err(|e| e.to_string())?;
+
+        transactions
+            .insert(transaction_key.as_str(), transaction_json.as_str())
+            .map_err(|e| e.to_string())?;
+    }
+
+    let sequence_record = VendoSequence {
+        vendo_id: event.vendo_id.clone(),
+        sequence: event.sequence,
+        event_id: event.event_id.clone(),
+        received_at,
+    };
+
+    let sequence_json = serde_json::to_string(&sequence_record).map_err(|e| e.to_string())?;
+
+    {
+        let mut sequences = write_txn
+            .open_table(VENDO_SEQUENCES_TABLE)
+            .map_err(|e| e.to_string())?;
+
+        sequences
+            .insert(event.vendo_id.as_str(), sequence_json.as_str())
+            .map_err(|e| e.to_string())?;
+    }
+
+    // Session credit, daily sales, transaction, and sequence commit together.
+    // Release the reservation after successful payment processing.
+    {
+        let mut reservations = write_txn
+            .open_table(VENDO_RESERVATIONS_TABLE)
+            .map_err(|e| e.to_string())?;
+
+        reservations
+            .remove(event.vendo_id.as_str())
+            .map_err(|e| e.to_string())?;
+    }
+    write_txn.commit().map_err(|e| e.to_string())?;
+
+    Ok(VendoPaymentResult::Credited {
+        session_id: credited_session_id,
+        session: credited_session,
+        browser_token,
+    })
+}
+
 /// Convert inserted amount to time in seconds using the rates table.
 pub fn convert_amount_to_time(amount: u32) -> u32 {
     let db = get_db();
@@ -609,9 +1460,7 @@ pub fn convert_amount_to_time(amount: u32) -> u32 {
         let count = (remaining / rate.price).floor() as u32;
 
         if count > 0 {
-            total_seconds = total_seconds.saturating_add(
-                count.saturating_mul(rate.time)
-            );
+            total_seconds = total_seconds.saturating_add(count.saturating_mul(rate.time));
 
             remaining -= (count as f64) * rate.price;
         }
@@ -737,8 +1586,7 @@ pub fn redeem_voucher_for_session(
                 .map_err(|e| e.to_string())?
                 .ok_or_else(|| "Original voucher session not found".to_string())?;
 
-            serde_json::from_str::<Session>(value.value())
-                .map_err(|e| e.to_string())?
+            serde_json::from_str::<Session>(value.value()).map_err(|e| e.to_string())?
         };
 
         // Settle the original session before deciding whether recovery is allowed.
@@ -754,10 +1602,7 @@ pub fn redeem_voucher_for_session(
                 .open_table(DEVICE_SESSIONS_TABLE)
                 .map_err(|e| e.to_string())?;
 
-            if let Some(existing) = devices
-                .get(mac)
-                .map_err(|e| e.to_string())?
-            {
+            if let Some(existing) = devices.get(mac).map_err(|e| e.to_string())? {
                 if existing.value() != session_id {
                     return Err("This device is already linked to another session".to_string());
                 }
@@ -768,8 +1613,7 @@ pub fn redeem_voucher_for_session(
             }
         }
 
-        let session_json =
-            serde_json::to_string(&session).map_err(|e| e.to_string())?;
+        let session_json = serde_json::to_string(&session).map_err(|e| e.to_string())?;
 
         {
             let mut sessions = write_txn
@@ -808,114 +1652,141 @@ pub fn redeem_voucher_for_session(
             .map_err(|e| e.to_string())?
             .ok_or_else(|| "Session not found".to_string())?;
 
-        serde_json::from_str::<Session>(value.value())
-            .map_err(|e| e.to_string())?
+        serde_json::from_str::<Session>(value.value()).map_err(|e| e.to_string())?
     };
 
     session.settle(now);
 
-    let (credited_session_id, credited_session, new_browser_token) =
-        if session.expired_at.is_some() {
-            // Preserve the expired session and start a completely new session.
-            let new_session_id = generate_secure_id()?;
-            let browser_token = generate_browser_token()?;
-            let token_hash = hash_recovery_token(&browser_token);
+    let (credited_session_id, credited_session, new_browser_token) = if session.expired_at.is_some()
+    {
+        // Preserve the expired session and start a completely new session.
+        let new_session_id = generate_secure_id()?;
+        let browser_token = generate_browser_token()?;
+        let token_hash = hash_recovery_token(&browser_token);
 
-            let mut new_session =
-                Session::new(session.name.clone(), session.ip.clone(), now);
-            new_session.remaining_seconds = voucher.time as u64;
-            new_session.last_accounted_at = now;
+        let mut new_session = Session::new(session.name.clone(), session.ip.clone(), now);
+        new_session.remaining_seconds = voucher.time as u64;
+        new_session.last_accounted_at = now;
 
-            let old_json =
-                serde_json::to_string(&session).map_err(|e| e.to_string())?;
-            let new_json =
-                serde_json::to_string(&new_session).map_err(|e| e.to_string())?;
+        let old_json = serde_json::to_string(&session).map_err(|e| e.to_string())?;
+        let new_json = serde_json::to_string(&new_session).map_err(|e| e.to_string())?;
 
+        {
+            let mut sessions = write_txn
+                .open_table(SESSIONS_TABLE)
+                .map_err(|e| e.to_string())?;
+
+            if sessions
+                .get(new_session_id.as_str())
+                .map_err(|e| e.to_string())?
+                .is_some()
             {
-                let mut sessions = write_txn
-                    .open_table(SESSIONS_TABLE)
-                    .map_err(|e| e.to_string())?;
-
-                if sessions
-                    .get(new_session_id.as_str())
-                    .map_err(|e| e.to_string())?
-                    .is_some()
-                {
-                    return Err("Generated session ID already exists".to_string());
-                }
-
-                sessions
-                    .insert(session_id.as_str(), old_json.as_str())
-                    .map_err(|e| e.to_string())?;
-
-                sessions
-                    .insert(new_session_id.as_str(), new_json.as_str())
-                    .map_err(|e| e.to_string())?;
+                return Err("Generated session ID already exists".to_string());
             }
 
-            {
-                let mut devices = write_txn
-                    .open_table(DEVICE_SESSIONS_TABLE)
-                    .map_err(|e| e.to_string())?;
+            sessions
+                .insert(session_id.as_str(), old_json.as_str())
+                .map_err(|e| e.to_string())?;
 
-                devices
-                    .insert(mac, new_session_id.as_str())
-                    .map_err(|e| e.to_string())?;
+            sessions
+                .insert(new_session_id.as_str(), new_json.as_str())
+                .map_err(|e| e.to_string())?;
+        }
+
+        {
+            let mut devices = write_txn
+                .open_table(DEVICE_SESSIONS_TABLE)
+                .map_err(|e| e.to_string())?;
+
+            devices
+                .insert(mac, new_session_id.as_str())
+                .map_err(|e| e.to_string())?;
+        }
+
+        {
+            let mut tokens = write_txn
+                .open_table(BROWSER_TOKENS_TABLE)
+                .map_err(|e| e.to_string())?;
+
+            if tokens
+                .get(token_hash.as_str())
+                .map_err(|e| e.to_string())?
+                .is_some()
+            {
+                return Err("Generated browser token already exists".to_string());
             }
 
-            {
-                let mut tokens = write_txn
-                    .open_table(BROWSER_TOKENS_TABLE)
-                    .map_err(|e| e.to_string())?;
+            tokens
+                .insert(token_hash.as_str(), new_session_id.as_str())
+                .map_err(|e| e.to_string())?;
+        }
 
-                if tokens
-                    .get(token_hash.as_str())
-                    .map_err(|e| e.to_string())?
-                    .is_some()
-                {
-                    return Err("Generated browser token already exists".to_string());
-                }
+        (new_session_id, new_session, Some(browser_token))
+    } else {
+        // Active sessions and fresh zero-time sessions are funded in place.
+        session.remaining_seconds = session
+            .remaining_seconds
+            .saturating_add(voucher.time as u64);
+        session.last_accounted_at = now;
 
-                tokens
-                    .insert(token_hash.as_str(), new_session_id.as_str())
+        let session_json = serde_json::to_string(&session).map_err(|e| e.to_string())?;
+
+        {
+            let mut sessions = write_txn
+                .open_table(SESSIONS_TABLE)
+                .map_err(|e| e.to_string())?;
+
+            sessions
+                .insert(session_id.as_str(), session_json.as_str())
+                .map_err(|e| e.to_string())?;
+        }
+
+        (session_id.clone(), session, None)
+    };
+
+        // Transfer this customer's vendo reservation to the replacement session.
+    // This update shares the voucher redemption transaction.
+    let matching_reservations = {
+        let reservations = write_txn
+            .open_table(VENDO_RESERVATIONS_TABLE)
+            .map_err(|e| e.to_string())?;
+
+        reservations
+            .iter()
+            .map_err(|e| e.to_string())?
+            .map(|entry| {
+                let (key, value) = entry.map_err(|e| e.to_string())?;
+                let reservation: VendoReservation =
+                    serde_json::from_str(value.value()).map_err(|e| e.to_string())?;
+                Ok((key.value().to_string(), reservation))
+            })
+            .collect::<Result<Vec<_>, String>>()?
+    };
+
+    {
+        let mut reservations = write_txn
+            .open_table(VENDO_RESERVATIONS_TABLE)
+            .map_err(|e| e.to_string())?;
+
+        for (vendo_id, mut reservation) in matching_reservations {
+            if reservation.session_id == session_id && reservation.mac == mac {
+                reservation.session_id = credited_session_id.clone();
+
+                let reservation_json =
+                    serde_json::to_string(&reservation).map_err(|e| e.to_string())?;
+
+                reservations
+                    .insert(vendo_id.as_str(), reservation_json.as_str())
                     .map_err(|e| e.to_string())?;
             }
-
-            (
-                new_session_id,
-                new_session,
-                Some(browser_token),
-            )
-        } else {
-            // Active sessions and fresh zero-time sessions are funded in place.
-            session.remaining_seconds = session
-                .remaining_seconds
-                .saturating_add(voucher.time as u64);
-            session.last_accounted_at = now;
-
-            let session_json =
-                serde_json::to_string(&session).map_err(|e| e.to_string())?;
-
-            {
-                let mut sessions = write_txn
-                    .open_table(SESSIONS_TABLE)
-                    .map_err(|e| e.to_string())?;
-
-                sessions
-                    .insert(session_id.as_str(), session_json.as_str())
-                    .map_err(|e| e.to_string())?;
-            }
-
-            (session_id.clone(), session, None)
-        };
-
-    // Associate the voucher with the session that actually received its time.
+        }
+    }
+// Associate the voucher with the session that actually received its time.
     voucher.used = true;
     voucher.session_id = Some(credited_session_id.clone());
     voucher.redeemed_at = Some(now);
 
-    let voucher_json =
-        serde_json::to_string(&voucher).map_err(|e| e.to_string())?;
+    let voucher_json = serde_json::to_string(&voucher).map_err(|e| e.to_string())?;
 
     {
         let mut vouchers = write_txn
@@ -942,12 +1813,7 @@ mod session_logic_tests {
 
     #[test]
     fn test_coin_and_voucher_session_lifecycle() {
-        let db_path = std::env::temp_dir().join(format!(
-            "librefi-session-logic-{}.redb",
-            generate_secure_id().unwrap()
-        ));
-
-        init_db(db_path.to_str().unwrap());
+        init_test_db_once();
 
         let now = current_timestamp();
 
@@ -956,20 +1822,27 @@ mod session_logic_tests {
         active.remaining_seconds = 100;
         active.paused = true;
 
-        create_session("test-active-session", &active, "test-mac-active", "test-token-active")
-            .unwrap();
+        create_session(
+            "test-active-session",
+            &active,
+            "test-mac-active",
+            "test-token-active",
+        )
+        .unwrap();
 
         let (active_id, active_result, active_token) =
-            credit_session_for_payment("test-active-session", "test-mac-active", 50, None)
-                .unwrap();
+            credit_session_for_payment("test-active-session", "test-mac-active", 50, None).unwrap();
 
         assert_eq!(active_id, "test-active-session");
         assert_eq!(active_result.remaining_seconds, 150);
         assert!(active_token.is_none());
 
         // 2. An expired session must be replaced by a new session.
-        let mut expired =
-            Session::new("Expired User".into(), "10.0.0.11".into(), now.saturating_sub(100));
+        let mut expired = Session::new(
+            "Expired User".into(),
+            "10.0.0.11".into(),
+            now.saturating_sub(100),
+        );
         expired.remaining_seconds = 10;
         expired.last_accounted_at = now.saturating_sub(100);
 
@@ -1001,8 +1874,7 @@ mod session_logic_tests {
         );
 
         // 3. An unused voucher must add time to the existing active session.
-        let mut voucher_session =
-            Session::new("Voucher User".into(), "10.0.0.12".into(), now);
+        let mut voucher_session = Session::new("Voucher User".into(), "10.0.0.12".into(), now);
         voucher_session.remaining_seconds = 200;
         voucher_session.paused = true;
 
@@ -1052,8 +1924,11 @@ mod session_logic_tests {
         assert!(recovery_token.is_none());
 
         // 5. An unused voucher after expiry must create a new session.
-        let mut expired_voucher_session =
-            Session::new("Expired Voucher User".into(), "10.0.0.13".into(), now.saturating_sub(100));
+        let mut expired_voucher_session = Session::new(
+            "Expired Voucher User".into(),
+            "10.0.0.13".into(),
+            now.saturating_sub(100),
+        );
         expired_voucher_session.remaining_seconds = 10;
         expired_voucher_session.last_accounted_at = now.saturating_sub(100);
 
@@ -1076,8 +1951,7 @@ mod session_logic_tests {
             redeemed_at: None,
         };
 
-        let expired_voucher_json =
-            serde_json::to_string(&expired_voucher).unwrap();
+        let expired_voucher_json = serde_json::to_string(&expired_voucher).unwrap();
 
         {
             let write_txn = get_db().begin_write().unwrap();
@@ -1091,11 +1965,7 @@ mod session_logic_tests {
         }
 
         let (replacement_id, replacement_session, replacement_credited, replacement_token) =
-            redeem_voucher_for_session(
-                "TESTVOUCHER2",
-                "test-mac-expired-voucher",
-            )
-            .unwrap();
+            redeem_voucher_for_session("TESTVOUCHER2", "test-mac-expired-voucher").unwrap();
 
         assert_ne!(replacement_id, "test-expired-voucher-session");
         assert_eq!(replacement_session.remaining_seconds, 600);
@@ -1118,5 +1988,301 @@ mod session_logic_tests {
                 .is_some()
         );
         assert!(voucher_token.is_none());
+
+        // MULTI-VENDO PAYMENT TESTS
+
+        let (vendo_one, vendo_one_credential) = register_vendo("Payment Test Vendo One").unwrap();
+
+        // Registration stores the SHA-256 verifier, not the raw credential.
+        let initial_verifier = get_vendo_auth_verifier(&vendo_one.vendo_id)
+            .unwrap()
+            .expect("Registered vendo should have an authentication verifier");
+
+        let initial_verifier_hex = initial_verifier
+            .iter()
+            .map(|byte| format!("{:02x}", byte))
+            .collect::<String>();
+
+        assert_eq!(
+            initial_verifier_hex,
+            hash_recovery_token(&vendo_one_credential)
+        );
+
+        let mut payment_session = Session::new("Payment Test User".into(), "10.0.0.20".into(), now);
+        payment_session.remaining_seconds = 100;
+        payment_session.paused = true;
+
+        create_session(
+            "test-vendo-payment-session",
+            &payment_session,
+            "test-vendo-payment-mac",
+            "test-vendo-payment-token",
+        )
+        .unwrap();
+
+        // Reserve this vendo for the payment test session.
+        {
+            let write_txn = get_db().begin_write().unwrap();
+            {
+                let mut reservations = write_txn
+                    .open_table(VENDO_RESERVATIONS_TABLE)
+                    .unwrap();
+
+                let reservation = VendoReservation {
+                    vendo_id: vendo_one.vendo_id.clone(),
+                    session_id: "test-vendo-payment-session".into(),
+                    mac: "test-vendo-payment-mac".into(),
+                    reserved_at: now,
+                };
+
+                let reservation_json = serde_json::to_string(&reservation).unwrap();
+
+                reservations
+                    .insert(vendo_one.vendo_id.as_str(), reservation_json.as_str())
+                    .unwrap();
+            }
+            write_txn.commit().unwrap();
+        }
+        let event_one = VendoPaymentEvent {
+            vendo_id: vendo_one.vendo_id.clone(),
+            event_id: "payment-event-1".into(),
+            sequence: 1,
+            amount: 10,
+            pulse_count: 1,
+            device_timestamp: 1000,
+        };
+
+        // First payment credits the existing session.
+        match credit_vendo_payment(
+            "test-vendo-payment-session",
+            "test-vendo-payment-mac",
+            60,
+            event_one.clone(),
+        )
+        .unwrap()
+        {
+            VendoPaymentResult::Credited { session, .. } => {
+                assert_eq!(session.remaining_seconds, 160);
+            }
+            _ => panic!("First payment should be credited"),
+        }
+
+        // An identical retry must not credit the session again.
+        assert!(matches!(
+            credit_vendo_payment(
+                "test-vendo-payment-session",
+                "test-vendo-payment-mac",
+                60,
+                event_one.clone(),
+            )
+            .unwrap(),
+            VendoPaymentResult::Duplicate { .. }
+        ));
+
+        assert_eq!(
+            get_session("test-vendo-payment-session")
+                .unwrap()
+                .unwrap()
+                .remaining_seconds,
+            160
+        );
+
+        // Reusing the event ID with different details must be rejected.
+        let mut conflicting_event = event_one.clone();
+        conflicting_event.amount = 11;
+
+        assert!(
+            credit_vendo_payment(
+                "test-vendo-payment-session",
+                "test-vendo-payment-mac",
+                60,
+                conflicting_event,
+            )
+            .is_err()
+        );
+
+        // Sequence 3 must be rejected because sequence 2 is expected.
+        let event_three = VendoPaymentEvent {
+            vendo_id: vendo_one.vendo_id.clone(),
+            event_id: "payment-event-3".into(),
+            sequence: 3,
+            amount: 5,
+            pulse_count: 1,
+            device_timestamp: 3000,
+        };
+
+        assert!(
+            credit_vendo_payment(
+                "test-vendo-payment-session",
+                "test-vendo-payment-mac",
+                30,
+                event_three,
+            )
+            .is_err()
+        );
+
+        // Disabling a vendo must not block an already-reserved payment.
+        set_vendo_enabled(&vendo_one.vendo_id, false).unwrap();
+
+        // Disabled vendos retain valid device authentication.
+        assert!(
+            get_vendo_auth_verifier(&vendo_one.vendo_id)
+                .unwrap()
+                .is_some()
+        );
+
+        let event_two = VendoPaymentEvent {
+            vendo_id: vendo_one.vendo_id.clone(),
+            event_id: "payment-event-2".into(),
+            sequence: 2,
+            amount: 5,
+            pulse_count: 1,
+            device_timestamp: 2000,
+        };
+
+        assert!(matches!(
+            credit_vendo_payment(
+                "test-vendo-payment-session",
+                "test-vendo-payment-mac",
+                30,
+                event_two,
+            )
+            .unwrap(),
+            VendoPaymentResult::Credited { .. }
+        ));
+
+        assert_eq!(
+            get_session("test-vendo-payment-session")
+                .unwrap()
+                .unwrap()
+                .remaining_seconds,
+            190
+        );
+
+        // Rotating a credential replaces the previous verifier.
+        let rotated_credential = rotate_vendo_credential(&vendo_one.vendo_id).unwrap();
+
+        let rotated_verifier = get_vendo_auth_verifier(&vendo_one.vendo_id)
+            .unwrap()
+            .expect("Rotated credential should have a verifier");
+
+        let rotated_verifier_hex = rotated_verifier
+            .iter()
+            .map(|byte| format!("{:02x}", byte))
+            .collect::<String>();
+
+        assert_eq!(
+            rotated_verifier_hex,
+            hash_recovery_token(&rotated_credential)
+        );
+        assert_ne!(initial_verifier, rotated_verifier);
+
+        // Revocation removes the verifier from authentication use.
+        revoke_vendo_credential(&vendo_one.vendo_id).unwrap();
+
+        assert!(
+            get_vendo_auth_verifier(&vendo_one.vendo_id)
+                .unwrap()
+                .is_none()
+        );
+
+        // A second vendo starts its own independent sequence at 1.
+        let (vendo_two, _) = register_vendo("Payment Test Vendo Two").unwrap();
+
+        // Give the second vendo its own independent customer session.
+        let mut second_payment_session =
+            Session::new("Second Vendo Test User".into(), "10.0.0.21".into(), now);
+        second_payment_session.remaining_seconds = 0;
+
+        create_session(
+            "test-second-vendo-session",
+            &second_payment_session,
+            "test-second-vendo-mac",
+            "test-second-vendo-token",
+        )
+        .unwrap();
+
+        // Reserve the second vendo for its own session.
+        {
+            let write_txn = get_db().begin_write().unwrap();
+            {
+                let mut reservations = write_txn
+                    .open_table(VENDO_RESERVATIONS_TABLE)
+                    .unwrap();
+
+                let reservation = VendoReservation {
+                    vendo_id: vendo_two.vendo_id.clone(),
+                    session_id: "test-second-vendo-session".into(),
+                    mac: "test-second-vendo-mac".into(),
+                    reserved_at: now,
+                };
+
+                let reservation_json = serde_json::to_string(&reservation).unwrap();
+
+                reservations
+                    .insert(vendo_two.vendo_id.as_str(), reservation_json.as_str())
+                    .unwrap();
+            }
+            write_txn.commit().unwrap();
+        }
+        let second_vendo_event_one = VendoPaymentEvent {
+            vendo_id: vendo_two.vendo_id.clone(),
+            event_id: "second-vendo-event-1".into(),
+            sequence: 1,
+            amount: 2,
+            pulse_count: 1,
+            device_timestamp: 4000,
+        };
+
+        assert!(matches!(
+            credit_vendo_payment(
+                "test-second-vendo-session",
+                "test-second-vendo-mac",
+                10,
+                second_vendo_event_one,
+            )
+            .unwrap(),
+            VendoPaymentResult::Credited { .. }
+        ));
+
+        // A failed payment must not consume the next sequence number.
+        let second_vendo_event_two = VendoPaymentEvent {
+            vendo_id: vendo_two.vendo_id.clone(),
+            event_id: "second-vendo-event-2".into(),
+            sequence: 2,
+            amount: 3,
+            pulse_count: 1,
+            device_timestamp: 5000,
+        };
+
+        assert!(
+            credit_vendo_payment(
+                "missing-session",
+                "missing-mac",
+                15,
+                second_vendo_event_two.clone(),
+            )
+            .is_err()
+        );
+
+        // The same event can succeed after the session mapping is corrected.
+        assert!(matches!(
+            credit_vendo_payment(
+                "test-second-vendo-session",
+                "test-second-vendo-mac",
+                15,
+                second_vendo_event_two,
+            )
+            .unwrap(),
+            VendoPaymentResult::Credited { .. }
+        ));
+
+        assert_eq!(
+            get_session("test-second-vendo-session")
+                .unwrap()
+                .unwrap()
+                .remaining_seconds,
+            25
+        );
     }
 }

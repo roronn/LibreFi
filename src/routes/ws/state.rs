@@ -167,3 +167,104 @@ pub fn get_subnet(ip: &str) -> String {
         ip.to_string()
     }
 }
+
+// Multi-vendo device connection tracking.
+
+#[derive(Clone, Debug)]
+pub struct VendoConnection {
+    pub generation: u64,
+    pub connected_at: Instant,
+}
+
+static VENDO_CONNECTIONS: LazyLock<Mutex<HashMap<String, VendoConnection>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+static NEXT_VENDO_CONNECTION_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+/// Registers a new authenticated device connection and returns its generation.
+pub fn register_vendo_connection(vendo_id: &str) -> u64 {
+    let generation = NEXT_VENDO_CONNECTION_GENERATION.fetch_add(1, Ordering::Relaxed);
+
+    VENDO_CONNECTIONS.lock().unwrap().insert(
+        vendo_id.to_string(),
+        VendoConnection {
+            generation,
+            connected_at: Instant::now(),
+        },
+    );
+
+    generation
+}
+
+/// Returns true only if this generation is still the current connection.
+pub fn is_current_vendo_connection(vendo_id: &str, generation: u64) -> bool {
+    VENDO_CONNECTIONS
+        .lock()
+        .unwrap()
+        .get(vendo_id)
+        .is_some_and(|connection| connection.generation == generation)
+}
+
+/// Removes a device only when the supplied generation is still current.
+pub fn unregister_vendo_connection(vendo_id: &str, generation: u64) -> bool {
+    let mut connections = VENDO_CONNECTIONS.lock().unwrap();
+
+    if connections
+        .get(vendo_id)
+        .is_some_and(|connection| connection.generation == generation)
+    {
+        connections.remove(vendo_id);
+        return true;
+    }
+
+    false
+}
+
+/// Checks whether a vendo currently has an authenticated WebSocket connection.
+pub fn is_vendo_online(vendo_id: &str) -> bool {
+    VENDO_CONNECTIONS.lock().unwrap().contains_key(vendo_id)
+}
+// Runs an operation while the vendo's authenticated connection remains locked.
+pub fn with_vendo_online<T>(
+    vendo_id: &str,
+    operation: impl FnOnce() -> T,
+) -> Option<T> {
+    let connections = VENDO_CONNECTIONS.lock().unwrap();
+
+    if !connections.contains_key(vendo_id) {
+        return None;
+    }
+
+    Some(operation())
+}
+
+/// Returns a snapshot of currently connected vendo IDs.
+pub fn list_online_vendo_ids() -> Vec<String> {
+    VENDO_CONNECTIONS.lock().unwrap().keys().cloned().collect()
+}
+
+#[cfg(test)]
+mod vendo_connection_tests {
+    use super::*;
+
+    #[test]
+    fn reconnect_replaces_old_generation_safely() {
+        let vendo_id = format!("test-vendo-{}", new_owner_id());
+
+        let first = register_vendo_connection(&vendo_id);
+        assert!(is_vendo_online(&vendo_id));
+        assert!(is_current_vendo_connection(&vendo_id, first));
+
+        let second = register_vendo_connection(&vendo_id);
+        assert_ne!(first, second);
+        assert!(!is_current_vendo_connection(&vendo_id, first));
+        assert!(is_current_vendo_connection(&vendo_id, second));
+
+        assert!(!unregister_vendo_connection(&vendo_id, first));
+        assert!(is_vendo_online(&vendo_id));
+        assert!(is_current_vendo_connection(&vendo_id, second));
+
+        assert!(unregister_vendo_connection(&vendo_id, second));
+        assert!(!is_vendo_online(&vendo_id));
+    }
+}

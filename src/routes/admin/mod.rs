@@ -5,6 +5,7 @@ pub mod qos;
 pub mod rates;
 pub mod users;
 pub mod vouchers;
+pub mod vendos;
 pub mod wifi;
 
 use crate::network::server::Server;
@@ -15,6 +16,7 @@ use rates::handle_rates;
 use users::handle_users;
 use vouchers::handle_vouchers;
 use wifi::handle_wifi;
+use vendos::handle_vendos;
 
 pub const LAN_SUBNET: &str = "10.0.";
 
@@ -55,4 +57,5 @@ pub fn admin(server: &mut Server) {
     handle_wifi(server);
     handle_coinslot_key(server);
     handle_dashboard(server);
+    handle_vendos(server);
 }

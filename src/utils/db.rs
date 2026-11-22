@@ -1121,7 +1121,7 @@ pub fn credit_session_for_payment(
     let result = credit_session_for_payment_in_transaction(
         &write_txn,
         session_id,
-        mac,
+        Some(mac),
         seconds,
         sale_amount,
     )?;
@@ -1134,14 +1134,15 @@ pub fn credit_session_for_payment(
 fn credit_session_for_payment_in_transaction(
     write_txn: &redb::WriteTransaction,
     session_id: &str,
-    mac: &str,
+    mac: Option<&str>,
     seconds: u64,
     sale_amount: Option<u32>,
 ) -> Result<(String, Session, Option<String>), String> {
     let now = current_timestamp();
 
-    // Abort if this MAC was reassigned before the payment transaction.
-    {
+    // Retain MAC mapping validation for legacy callers. The new
+    // browser-token-authenticated flow does not treat MAC as identity.
+    if let Some(mac) = mac {
         let devices = write_txn
             .open_table(DEVICE_SESSIONS_TABLE)
             .map_err(|e| e.to_string())?;
@@ -1205,7 +1206,7 @@ fn credit_session_for_payment_in_transaction(
                 .map_err(|e| e.to_string())?;
         }
 
-        {
+        if let Some(mac) = mac {
             let mut devices = write_txn
                 .open_table(DEVICE_SESSIONS_TABLE)
                 .map_err(|e| e.to_string())?;
@@ -1274,11 +1275,31 @@ fn credit_session_for_payment_in_transaction(
 
     Ok((result_id, result_session, new_browser_token))
 }
-/// Atomically records and credits one vendo payment event.
-/// Duplicate events never credit session time or sales twice.
+/// Atomically records and credits one vendo payment event using a legacy
+/// MAC mapping. Retained for existing callers.
 pub fn credit_vendo_payment(
     session_id: &str,
     mac: &str,
+    seconds: u64,
+    event: VendoPaymentEvent,
+) -> Result<VendoPaymentResult, String> {
+    credit_vendo_payment_internal(session_id, Some(mac), seconds, event)
+}
+
+/// Credits a payment for a browser-token-authenticated customer session.
+/// The active reservation binds the vendo to the session; MAC is not used
+/// as a customer identity or authorization factor.
+pub fn credit_vendo_payment_for_session(
+    session_id: &str,
+    seconds: u64,
+    event: VendoPaymentEvent,
+) -> Result<VendoPaymentResult, String> {
+    credit_vendo_payment_internal(session_id, None, seconds, event)
+}
+
+fn credit_vendo_payment_internal(
+    session_id: &str,
+    mac: Option<&str>,
     seconds: u64,
     event: VendoPaymentEvent,
 ) -> Result<VendoPaymentResult, String> {

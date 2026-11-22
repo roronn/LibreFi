@@ -861,7 +861,7 @@ mod auth_smoke_tests {
                 }
             }
 
-            for client in customer_clients {
+            for mut client in customer_clients {
                 let _ = client.close(None);
             }
         }).await;

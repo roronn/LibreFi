@@ -2253,6 +2253,14 @@ mod session_logic_tests {
             _ => panic!("First payment should be credited"),
         }
 
+        // A successful payment must release the reservation immediately.
+        assert!(
+            get_vendo_reservation_for_vendo(&vendo_one.vendo_id)
+                .unwrap()
+                .is_none(),
+            "Successful payment must release the vendo reservation"
+        );
+
         // An identical retry must not credit the session again.
         assert!(matches!(
             credit_vendo_payment(
@@ -2477,6 +2485,16 @@ mod session_logic_tests {
             .is_err()
         );
 
+        // A failed payment must leave the reservation intact for retry.
+        let retained_reservation =
+            get_vendo_reservation_for_vendo(&vendo_two.vendo_id)
+                .unwrap()
+                .expect("Failed payment must retain the reservation");
+        assert_eq!(
+            retained_reservation.session_id,
+            "test-second-vendo-session"
+        );
+
         // The same event can succeed after the session mapping is corrected.
         assert!(matches!(
             credit_vendo_payment_for_session(
@@ -2494,6 +2512,13 @@ mod session_logic_tests {
                 .unwrap()
                 .remaining_seconds,
             25
+        );
+
+        assert!(
+            get_vendo_reservation_for_vendo(&vendo_two.vendo_id)
+                .unwrap()
+                .is_none(),
+            "Successful retry must release the reservation"
         );
 
         assert!(

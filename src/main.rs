@@ -8,6 +8,7 @@ use routes::index::index;
 use crate::routes::{
     admin::admin,
     coin::coin,
+    customer_identity::customer_identity,
     debug::debug,
     init::init,
     play_pause::play_pause,
@@ -97,10 +98,10 @@ fn main() {
 
     play_pause(&mut server);
     init(&mut server);
+    customer_identity(&mut server);
     admin(&mut server);
     rates(&mut server);
     redeem(&mut server);
     coin(&mut server);
-    // Temporarily disabled during Axum migration; restore in the WebSocket stage.
     server.run();
 }

@@ -76,8 +76,7 @@ fn json_response(
 pub fn handle_vendos(server: &mut Server) {
     // List vendos. Raw credentials and stored credential hashes are never returned.
     server.get("/api/admin/vendos", |req, res| {
-        if parse_admin_payload(req).is_err() {
-            let (status, body) = parse_admin_payload(req).unwrap_err();
+        if let Err((status, body)) = parse_admin_payload(req) {
             res.status = status;
             res.body = body;
             res.content_type = "application/json".to_string();

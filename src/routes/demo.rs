@@ -183,12 +183,15 @@ pub fn demo(server: &mut Server) {
         };
 
         match credit_vendo_payment_for_session(&session_id, seconds as u64, event) {
-            Ok(VendoPaymentResult::Credited { browser_token, .. }) => {
+            Ok(VendoPaymentResult::Credited { session, browser_token, .. }) => {
                 let mut notification = json!({
                     "type": "coin",
                     "value": payload.amount,
                     "time": seconds,
                 });
+                if let Some(code) = session.recovery_voucher_code {
+                    notification["recovery_voucher"] = json!(code);
+                }
                 if let Some(token) = browser_token {
                     notification["browser_token"] = json!(token);
                 }

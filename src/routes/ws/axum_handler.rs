@@ -453,6 +453,187 @@ mod auth_smoke_tests {
     use tokio::net::TcpListener;
     use tungstenite::{Message, connect};
 
+
+
+    #[tokio::test]
+    async fn stress_test_ten_vendos_authenticate_and_process_payments_over_websockets() {
+        use crate::routes::ws::state::is_vendo_online;
+        use crate::utils::crypto::{decrypt_payload, derive_vendo_session_key, encrypt_payload, vendo_auth_proof};
+        use crate::utils::db::{
+            create_session, get_db, get_session, init_test_db_once, register_vendo,
+            reserve_vendo_for_customer_session, Session, RATES_TABLE,
+        };
+        use redb::TableDefinition;
+        use redb::WritableTable;
+        use std::sync::{Arc, Barrier};
+        use tungstenite::{connect, Message};
+
+        const VENDO_COUNT: usize = 10;
+        init_test_db_once();
+
+        let test_id = crate::utils::db::generate_secure_id().unwrap();
+
+        // Give this isolated test a known payment rate: 10 units = 60 seconds.
+        let rate_key = format!("ws-stress-rate-{test_id}");
+        let rate_value = serde_json::json!({ "price": 10.0, "time": 60 }).to_string();
+        {
+            let db = get_db();
+            let write_txn = db.begin_write().unwrap();
+            {
+                let mut rates = write_txn.open_table(RATES_TABLE).unwrap();
+                rates.insert(rate_key.as_str(), rate_value.as_str()).unwrap();
+            }
+            write_txn.commit().unwrap();
+        }
+
+        // Prepare ten unique vendo credentials and customer sessions.
+        let mut devices = Vec::with_capacity(VENDO_COUNT);
+        for index in 0..VENDO_COUNT {
+            let (vendo, credential) =
+                register_vendo(&format!("WS Stress Vendo {index}")).unwrap();
+            let session_id = format!("ws-stress-session-{test_id}-{index}");
+            let mac = format!("02:20:00:{:02x}:{:02x}:{:02x}", index / 256, index % 256, index + 1);
+            let token = format!("ws-stress-token-{test_id}-{index}");
+            let mut session = Session::new(
+                format!("WS Stress Customer {index}"),
+                "127.0.0.1".to_string(),
+                crate::utils::db::current_timestamp(),
+            );
+            session.remaining_seconds = 100;
+            session.paused = true;
+
+            create_session(&session_id, &session, &mac, &token).unwrap();
+            devices.push((vendo, credential, session_id));
+        }
+
+        // Run the production Axum vendo WebSocket route on an ephemeral port.
+        let app = Router::new().route("/ws/vendo", get(super::axum_ws_handler));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+        let url = format!("ws://{}/ws/vendo", address);
+
+        let worker_result = tokio::task::spawn_blocking(move || {
+            // Authenticate all ten independent WebSocket connections first.
+            let mut clients = Vec::with_capacity(VENDO_COUNT);
+            for (index, (vendo, _credential, session_id)) in devices.iter().enumerate() {
+                let verifier = crate::utils::db::get_vendo_auth_verifier(&vendo.vendo_id)
+                    .unwrap()
+                    .expect("Registered vendo must have a credential verifier");
+
+                let (mut client, _) = connect(url.as_str()).unwrap();
+                client.send(Message::Text(serde_json::json!({
+                    "type": "HELLO",
+                    "vendo_id": vendo.vendo_id,
+                }).to_string().into())).unwrap();
+
+                let challenge_text = match client.read().unwrap() {
+                    Message::Text(text) => text.to_string(),
+                    other => panic!("Vendo {index}: expected CHALLENGE, received {other:?}"),
+                };
+                let challenge_json: serde_json::Value =
+                    serde_json::from_str(&challenge_text).unwrap();
+                assert_eq!(challenge_json["type"], "CHALLENGE");
+                let challenge_bytes = STANDARD
+                    .decode(challenge_json["challenge"].as_str().unwrap())
+                    .unwrap();
+                let challenge: [u8; 32] = challenge_bytes.try_into().unwrap();
+
+                let proof = vendo_auth_proof(&verifier, &vendo.vendo_id, &challenge).unwrap();
+                client.send(Message::Text(serde_json::json!({
+                    "type": "AUTH",
+                    "proof": STANDARD.encode(proof),
+                }).to_string().into())).unwrap();
+
+                let auth_text = match client.read().unwrap() {
+                    Message::Text(text) => text.to_string(),
+                    other => panic!("Vendo {index}: expected AUTH_OK, received {other:?}"),
+                };
+                let auth_json: serde_json::Value = serde_json::from_str(&auth_text).unwrap();
+                assert_eq!(auth_json["type"], "AUTH_OK");
+                assert!(is_vendo_online(&vendo.vendo_id));
+
+                // Reservation is allowed only after the real WebSocket has
+                // completed authentication and registered the vendo online.
+                reserve_vendo_for_customer_session(&vendo.vendo_id, session_id)
+                    .expect("Authenticated vendo should reserve its customer session");
+
+                let session_key =
+                    derive_vendo_session_key(&verifier, &vendo.vendo_id, &challenge).unwrap();
+                clients.push((client, session_id.clone(), session_key, index));
+            }
+
+            // Release all ten real WebSocket clients to send a payment together.
+            let barrier = Arc::new(Barrier::new(VENDO_COUNT + 1));
+            let mut senders = Vec::with_capacity(VENDO_COUNT);
+            for (mut client, session_id, session_key, index) in clients {
+                let barrier_for_worker = Arc::clone(&barrier);
+                senders.push(std::thread::spawn(move || {
+                    barrier_for_worker.wait();
+
+                    let event_id = format!("ws-payment-{test_id}-{index}");
+                    let plaintext = serde_json::json!({
+                        "type": "PAYMENT",
+                        "event_id": event_id,
+                        "sequence": 1,
+                        "amount": 10,
+                        "pulse_count": 1,
+                        "device_timestamp": 1,
+                    }).to_string();
+                    let encrypted = encrypt_payload(&plaintext, &session_key).unwrap();
+                    let envelope = serde_json::json!({
+                        "type": "ENCRYPTED",
+                        "payload": STANDARD.encode(encrypted),
+                    });
+                    client.send(Message::Text(envelope.to_string().into())).unwrap();
+
+                    let response_text = match client.read().unwrap() {
+                        Message::Text(text) => text.to_string(),
+                        other => panic!("Vendo {index}: expected encrypted payment response, received {other:?}"),
+                    };
+                    let response: serde_json::Value =
+                        serde_json::from_str(&response_text).unwrap();
+                    assert_eq!(response["type"], "ENCRYPTED");
+
+                    let response_bytes = STANDARD
+                        .decode(response["payload"].as_str().unwrap())
+                        .unwrap();
+                    let response_plaintext =
+                        decrypt_payload(&response_bytes, &session_key).unwrap();
+                    let payment_result: serde_json::Value =
+                        serde_json::from_str(&response_plaintext).unwrap();
+
+                    assert_eq!(payment_result["type"], "PAYMENT_ACCEPTED");
+                    assert_eq!(payment_result["event_id"], event_id);
+                    assert_eq!(payment_result["credited_seconds"], 60);
+
+                    let session = get_session(&session_id)
+                        .unwrap()
+                        .expect("Customer session should remain available");
+                    assert_eq!(session.remaining_seconds, 160);
+
+                    let _ = client.close(None);
+                }));
+            }
+
+            barrier.wait();
+            for sender in senders {
+                sender.join().expect("Vendo payment worker must not panic");
+            }
+        })
+        .await;
+
+        server_task.abort();
+        worker_result.expect("Concurrent WebSocket payment test task should complete");
+    }
+
     #[tokio::test]
     async fn websocket_authentication_smoke_test() {
         use crate::utils::db::{get_vendo_auth_verifier, init_test_db_once, register_vendo};

@@ -428,10 +428,10 @@ fn ensure_customer_for_session(
     Ok(())
 }
 
-pub fn create_session(
+fn create_session_internal(
     session_id: &str,
     session: &Session,
-    mac: &str,
+    mac: Option<&str>,
     browser_token: &str,
 ) -> Result<(), String> {
     let db = get_db();
@@ -459,7 +459,7 @@ pub fn create_session(
             .map_err(|e| e.to_string())?;
     }
 
-    {
+    if let Some(mac) = mac {
         let mut devices = write_txn
             .open_table(DEVICE_SESSIONS_TABLE)
             .map_err(|e| e.to_string())?;
@@ -490,6 +490,26 @@ pub fn create_session(
     }
 
     write_txn.commit().map_err(|e| e.to_string())
+}
+
+/// Creates a session with a legacy device mapping. New customer identity flows
+/// should use create_session_without_device so a MAC address is never identity.
+pub fn create_session(
+    session_id: &str,
+    session: &Session,
+    mac: &str,
+    browser_token: &str,
+) -> Result<(), String> {
+    create_session_internal(session_id, session, Some(mac), browser_token)
+}
+
+/// Creates a session authenticated only by its browser recovery token.
+pub fn create_session_without_device(
+    session_id: &str,
+    session: &Session,
+    browser_token: &str,
+) -> Result<(), String> {
+    create_session_internal(session_id, session, None, browser_token)
 }
 fn constant_time_string_eq(left: &str, right: &str) -> bool {
     let left_bytes = left.as_bytes();

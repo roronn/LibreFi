@@ -960,6 +960,28 @@ pub fn get_vendo_reservation_for_session(
     Ok(None)
 }
 
+/// Returns the next expected payment sequence for a vendo.
+pub fn next_vendo_payment_sequence(vendo_id: &str) -> Result<u64, String> {
+    let db = get_db();
+    let read_txn = db.begin_read().map_err(|error| error.to_string())?;
+    let sequences = read_txn
+        .open_table(VENDO_SEQUENCES_TABLE)
+        .map_err(|error| error.to_string())?;
+
+    match sequences.get(vendo_id).map_err(|error| error.to_string())? {
+        Some(value) => {
+            let previous: VendoSequence =
+                serde_json::from_str(value.value()).map_err(|error| error.to_string())?;
+            if previous.vendo_id != vendo_id {
+                return Err("Vendo sequence record ID mismatch".to_string());
+            }
+            previous.sequence.checked_add(1)
+                .ok_or_else(|| "Vendo sequence number exhausted".to_string())
+        }
+        None => Ok(1),
+    }
+}
+
 /// Looks up the active customer reservation for a specific vendo.
 pub fn get_vendo_reservation_for_vendo(
     vendo_id: &str,

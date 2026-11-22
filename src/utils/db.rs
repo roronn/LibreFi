@@ -1932,12 +1932,26 @@ mod session_logic_tests {
         )
         .unwrap();
 
+        let expired_customer_id = get_session("test-expired-session")
+            .unwrap()
+            .unwrap()
+            .customer_id
+            .expect("Created session must have a customer ID");
+
         let (new_id, new_session, new_token) =
             credit_session_for_payment("test-expired-session", "test-mac-expired", 300, None)
                 .unwrap();
 
         assert_ne!(new_id, "test-expired-session");
         assert_eq!(new_session.remaining_seconds, 300);
+        assert_eq!(new_session.customer_id.as_deref(), Some(expired_customer_id.as_str()));
+        {
+            let read_txn = get_db().begin_read().unwrap();
+            let customers = read_txn.open_table(CUSTOMERS_TABLE).unwrap();
+            let record = customers.get(expired_customer_id.as_str()).unwrap().unwrap();
+            let customer: Customer = serde_json::from_str(record.value()).unwrap();
+            assert_eq!(customer.active_session_id, new_id);
+        }
         assert!(new_token.is_some());
         assert_eq!(
             find_session_by_mac("test-mac-expired").unwrap(),

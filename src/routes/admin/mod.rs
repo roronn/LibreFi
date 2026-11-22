@@ -1,5 +1,4 @@
 pub mod auth;
-pub mod coinslot_key;
 pub mod dashboard;
 pub mod qos;
 pub mod rates;
@@ -9,7 +8,6 @@ pub mod vendos;
 pub mod wifi;
 
 use crate::network::server::Server;
-use coinslot_key::handle_coinslot_key;
 use dashboard::handle_dashboard;
 use qos::handle_qos;
 use rates::handle_rates;
@@ -55,7 +53,6 @@ pub fn admin(server: &mut Server) {
     handle_qos(server);
     handle_users(server);
     handle_wifi(server);
-    handle_coinslot_key(server);
     handle_dashboard(server);
     handle_vendos(server);
 }

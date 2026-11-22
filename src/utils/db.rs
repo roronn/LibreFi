@@ -1993,6 +1993,26 @@ mod session_logic_tests {
         assert_eq!(credited_session.remaining_seconds, 500);
         assert!(credited);
 
+        let voucher_customer_id = credited_session
+            .customer_id
+            .clone()
+            .expect("Voucher session must have a permanent customer ID");
+        {
+            let read_txn = get_db().begin_read().unwrap();
+            let vouchers = read_txn.open_table(VOUCHERS_TABLE).unwrap();
+            let record = vouchers.get("TESTVOUCHER1").unwrap().unwrap();
+            let stored_voucher: Voucher = serde_json::from_str(record.value()).unwrap();
+            assert_eq!(
+                stored_voucher.customer_id.as_deref(),
+                Some(voucher_customer_id.as_str())
+            );
+
+            let customers = read_txn.open_table(CUSTOMERS_TABLE).unwrap();
+            let record = customers.get(voucher_customer_id.as_str()).unwrap().unwrap();
+            let customer: Customer = serde_json::from_str(record.value()).unwrap();
+            assert_eq!(customer.active_session_id, "test-voucher-session");
+        }
+
         // 4. Recovering a used voucher must not credit its time again.
         let (recovered_id, recovered_session, credited_again, recovery_token) =
             redeem_voucher_for_session("TESTVOUCHER1", "test-mac-voucher").unwrap();

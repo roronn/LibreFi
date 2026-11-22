@@ -31,6 +31,9 @@ function Coin({ children, onClose }: { children: ReactElement, onClose?: () => v
     const [lastVoucher, setLastVoucher] = useState("");
     const [recoveryStatus, setRecoveryStatus] = useState<boolean | null>(null);
     const [isCheckingRecovery, setIsCheckingRecovery] = useState(false);
+    const [vendoOptions, setVendoOptions] = useState<Array<{ vendo_id: string; name: string }>>([]);
+    const [isChoosingVendo, setIsChoosingVendo] = useState(false);
+    const [isSelectingVendo, setIsSelectingVendo] = useState(false);
     const wsRef = useRef<WebSocket | null>(null);
     const pingRef = useRef<number | null>(null);
     const timerRef = useRef<number | null>(null);
@@ -53,6 +56,9 @@ function Coin({ children, onClose }: { children: ReactElement, onClose?: () => v
             timerRef.current = null;
         }
         setTotalCoins(0);
+        setVendoOptions([]);
+        setIsChoosingVendo(false);
+        setIsSelectingVendo(false);
         onClose?.();
     }
 
@@ -90,7 +96,7 @@ function Coin({ children, onClose }: { children: ReactElement, onClose?: () => v
         const ws = new WebSocket(wsUrl);
         wsRef.current = ws;
 
-        const loadingToast = toast.loading("Contacting coinslot...", {
+        const loadingToast = toast.loading("Finding an available vendo...", {
             position: "top-center"
         });
 
@@ -112,21 +118,54 @@ function Coin({ children, onClose }: { children: ReactElement, onClose?: () => v
             }));
         };
 
+        let paymentWindowStarted = false;
+
         ws.onmessage = (event) => {
             console.log("Received WS message:", event.data);
             try {
                 const data = JSON.parse(event.data);
-                if (data.error) {
+
+                if (data.type === "CUSTOMER_AUTH_OK") {
+                    // Authentication alone does not authorize coin insertion.
+                    return;
+                }
+
+                if (data.type === "VENDO_OPTIONS") {
+                    const options = Array.isArray(data.available)
+                        ? data.available.filter((item: unknown): item is { vendo_id: string; name: string } =>
+                            !!item &&
+                            typeof item === "object" &&
+                            typeof (item as { vendo_id?: unknown }).vendo_id === "string" &&
+                            typeof (item as { name?: unknown }).name === "string"
+                        )
+                        : [];
+
+                    if (options.length === 0) {
+                        // No eligible vendo: stay silent as requested.
+                        clearTimeout(timeoutId);
+                        toast.dismiss(loadingToast);
+                        ws.close();
+                        if (wsRef.current === ws) wsRef.current = null;
+                        return;
+                    }
+
                     clearTimeout(timeoutId);
                     toast.dismiss(loadingToast);
-                    toast.error("Coinslot is not available!", {
-                        description: data.error,
-                        position: "top-center"
-                    });
-                    ws.close();
-                } else if (data.ok || data.status === "ok" || data.type === "ACK_SUCCESS") {
+                    setVendoOptions(options);
+                    setIsSelectingVendo(false);
+                    setIsChoosingVendo(true);
+                    setIsOpen(true);
+                    return;
+                }
+
+                if (data.type === "VENDO_ASSIGNED") {
+                    if (paymentWindowStarted) return;
+                    paymentWindowStarted = true;
                     clearTimeout(timeoutId);
                     toast.dismiss(loadingToast);
+                    setIsChoosingVendo(false);
+                    setIsSelectingVendo(false);
+                    setVendoOptions([]);
                     void loadLastVoucher();
                     setIsOpen(true);
                     setTimeLeft(29);
@@ -150,13 +189,33 @@ function Coin({ children, onClose }: { children: ReactElement, onClose?: () => v
                             }
                         }, 500);
                     }
-                } else if (data.type === "notify") {
+                    return;
+                }
+
+                if (data.type === "VENDO_ASSIGNMENT_FAILED") {
+                    setIsSelectingVendo(false);
+                    toast.error("Vendo selection failed", {
+                        description: typeof data.reason === "string" ? data.reason : "Please choose an available vendo.",
+                        position: "top-center"
+                    });
+                    return;
+                }
+
+                if (data.error) {
+                    clearTimeout(timeoutId);
+                    toast.dismiss(loadingToast);
+                    toast.error("Coinslot is not available!", {
+                        description: data.error,
+                        position: "top-center"
+                    });
+                    ws.close();
+                    return;
+                }
+
+                if (data.type === "notify") {
                     setTimeLeft(29);
                 } else if (data.type === "timer") {
-                    // Ignore backend timer to prefer local smooth timer
-                    // const secs = Number(data.value) || 0;
-                    // setTimeLeft(secs);
-                    // if (secs <= 0) closeModal();
+                    // Ignore backend timer to prefer local smooth timer.
                 } else if (data.type === "coin") {
                     let amount = data.value || 0;
                     let seconds = data.time || 0;
@@ -210,38 +269,73 @@ function Coin({ children, onClose }: { children: ReactElement, onClose?: () => v
             <DialogContent>
                 <DialogHeader>
                     <span className="absolute right-2 top-2 block h-6 w-6 bg-popover z-40" />
-                    <DialogTitle>Insert Coins</DialogTitle>
+                    <DialogTitle>{isChoosingVendo ? "Choose a vendo" : "Insert Coins"}</DialogTitle>
                     <DialogDescription>
-                        Click done after inserting coins.
+                        {isChoosingVendo
+                            ? "Want to choose another vendo?"
+                            : "Click done after inserting coins."}
                     </DialogDescription>
                 </DialogHeader>
-                <div className="flex flex-col gap-3">
-                    <Progress timeLeft={timeLeft} totalCoins={totalCoins} />
+                {isChoosingVendo ? (
+                    <div className="flex flex-col gap-2">
+                        {vendoOptions.map(vendo => (
+                            <Button
+                                key={vendo.vendo_id}
+                                type="button"
+                                variant="outline"
+                                className="w-full justify-start"
+                                disabled={isSelectingVendo}
+                                onClick={() => {
+                                    const ws = wsRef.current;
+                                    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+                                    setIsSelectingVendo(true);
+                                    ws.send(JSON.stringify({
+                                        type: "SELECT_VENDO",
+                                        vendo_id: vendo.vendo_id
+                                    }));
+                                }}
+                            >
+                                {vendo.name}
+                            </Button>
+                        ))}
+                        <Button
+                            type="button"
+                            variant="ghost"
+                            className="w-full"
+                            onClick={closeModal}
+                        >
+                            Cancel
+                        </Button>
+                    </div>
+                ) : (
+                    <div className="flex flex-col gap-3">
+                        <Progress timeLeft={timeLeft} totalCoins={totalCoins} />
 
-                    {lastVoucher && (
-                        <div className="rounded-md border p-3 text-sm">
-                            <p className="font-medium">Your last voucher</p>
-                            <p className="font-mono text-base">{lastVoucher}</p>
-                            {isCheckingRecovery ? (
-                                <p className="mt-2 text-muted-foreground">
-                                    Checking voucher recovery status...
-                                </p>
-                            ) : recoveryStatus === true ? (
-                                <p className="mt-2">
-                                    Your last voucher is still recoverable. Keep it safe! You can use this code to recover your session if you lose your connection or need to log in.
-                                </p>
-                            ) : recoveryStatus === false ? (
-                                <p className="mt-2">
-                                    Your previous voucher could not be recovered. Your session has expired. Please purchase a new voucher or insert coins.
-                                </p>
-                            ) : null}
-                        </div>
-                    )}
+                        {lastVoucher && (
+                            <div className="rounded-md border p-3 text-sm">
+                                <p className="font-medium">Your last voucher</p>
+                                <p className="font-mono text-base">{lastVoucher}</p>
+                                {isCheckingRecovery ? (
+                                    <p className="mt-2 text-muted-foreground">
+                                        Checking voucher recovery status...
+                                    </p>
+                                ) : recoveryStatus === true ? (
+                                    <p className="mt-2">
+                                        Your last voucher is still recoverable. Keep it safe! You can use this code to recover your session if you lose your connection or need to log in.
+                                    </p>
+                                ) : recoveryStatus === false ? (
+                                    <p className="mt-2">
+                                        Your previous voucher could not be recovered. Your session has expired. Please purchase a new voucher or insert coins.
+                                    </p>
+                                ) : null}
+                            </div>
+                        )}
 
-                    <Button onClick={closeModal} className="w-full cursor-pointer hover:bg-primary/80" >
-                        Done
-                    </Button>
-                </div>
+                        <Button onClick={closeModal} className="w-full cursor-pointer hover:bg-primary/80" >
+                            Done
+                        </Button>
+                    </div>
+                )}
             </DialogContent>
         </Dialog>
     )

@@ -26,21 +26,12 @@ fn json_error(status: u16, message: &str, res: &mut Response) {
     res.content_type = "application/json".to_string();
 }
 
-fn is_valid_mac(mac: &str) -> bool {
-    let parts: Vec<&str> = mac.split(':').collect();
-
-    parts.len() == 6
-        && parts
-            .iter()
-            .all(|part| part.len() == 2 && part.chars().all(|c| c.is_ascii_hexdigit()))
-}
-
-fn get_fail_count(mac: &str) -> (u32, u64) {
+fn get_fail_count(client_key: &str) -> (u32, u64) {
     let db = get_db();
 
     if let Ok(read_txn) = db.begin_read() {
         if let Ok(table) = read_txn.open_table(CONFIG_TABLE) {
-            let key = format!("redeem_fail:{}", mac);
+            let key = format!("redeem_fail:{}", client_key);
 
             if let Ok(Some(value)) = table.get(key.as_str()) {
                 let parts: Vec<&str> = value.value().splitn(2, ':').collect();
@@ -58,7 +49,7 @@ fn get_fail_count(mac: &str) -> (u32, u64) {
     (0, 0)
 }
 
-fn set_fail_count(mac: &str, count: u32) {
+fn set_fail_count(client_key: &str, count: u32) {
     let db = get_db();
 
     if let Ok(write_txn) = db.begin_write() {
@@ -78,7 +69,7 @@ fn set_fail_count(mac: &str, count: u32) {
     }
 }
 
-fn clear_fail_count(mac: &str) {
+fn clear_fail_count(client_key: &str) {
     let db = get_db();
 
     if let Ok(write_txn) = db.begin_write() {
@@ -218,8 +209,6 @@ pub fn redeem(server: &mut Server) {
         };
 
         let code = body.code.trim();
-        let browser_token = body.browser_token.as_deref().unwrap_or("").trim();
-
         if code.is_empty() || code.len() > 64 {
             json_error(400, "Invalid voucher code", res);
             return;
@@ -306,5 +295,4 @@ pub fn redeem(server: &mut Server) {
             }
         }
     });
-}
 }

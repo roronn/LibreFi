@@ -395,6 +395,81 @@ pub fn complete_customer_challenge(
     })
 }
 
+
+/// Revokes every browser token and registered device key for a customer
+/// inside the caller's redb write transaction.
+pub fn revoke_customer_credentials_in_transaction(
+    write_txn: &redb::WriteTransaction,
+    session_id: &str,
+) -> Result<(), String> {
+    let token_hashes = {
+        let tokens = write_txn
+            .open_table(BROWSER_TOKENS_TABLE)
+            .map_err(|error| error.to_string())?;
+        tokens
+            .iter()
+            .map_err(|error| error.to_string())?
+            .map(|entry| {
+                let (key, value) = entry.map_err(|error| error.to_string())?;
+                Ok(if value.value() == session_id {
+                    Some(key.value().to_string())
+                } else {
+                    None
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+    };
+
+    {
+        let mut tokens = write_txn
+            .open_table(BROWSER_TOKENS_TABLE)
+            .map_err(|error| error.to_string())?;
+        for token_hash in token_hashes {
+            tokens.remove(token_hash.as_str()).map_err(|error| error.to_string())?;
+        }
+    }
+
+    let matching_keys = {
+        let keys = write_txn
+            .open_table(CUSTOMER_DEVICE_KEYS_TABLE)
+            .map_err(|error| error.to_string())?;
+        keys.iter()
+            .map_err(|error| error.to_string())?
+            .map(|entry| {
+                let (key, value) = entry.map_err(|error| error.to_string())?;
+                let record: CustomerDeviceKey =
+                    serde_json::from_str(value.value()).map_err(|error| error.to_string())?;
+                Ok(if record.session_id == session_id && record.revoked_at.is_none() {
+                    Some((key.value().to_string(), record))
+                } else {
+                    None
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+    };
+
+    {
+        let mut keys = write_txn
+            .open_table(CUSTOMER_DEVICE_KEYS_TABLE)
+            .map_err(|error| error.to_string())?;
+        for (key_hash, mut record) in matching_keys {
+            record.revoked_at = Some(crate::utils::db::current_timestamp());
+            let record_json =
+                serde_json::to_string(&record).map_err(|error| error.to_string())?;
+            keys.insert(key_hash.as_str(), record_json.as_str())
+                .map_err(|error| error.to_string())?;
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

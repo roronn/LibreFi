@@ -395,6 +395,51 @@ mod tests {
     }
 
     #[test]
+    fn customer_reconnect_restores_reservation_when_vendo_is_offline() {
+        use crate::utils::db::{
+            create_session, init_test_db_once, register_vendo,
+            reserve_vendo_for_customer_session,
+        };
+
+        init_test_db_once();
+
+        let (vendo, _credential) = register_vendo("Offline Reconnect Test Vendo").unwrap();
+        let generation =
+            crate::routes::ws::state::register_vendo_connection(&vendo.vendo_id);
+
+        let session_id = format!("offline-reconnect-session-{}", vendo.vendo_id);
+        let session = crate::utils::db::Session::new(
+            "Offline Reconnect Test Customer".to_string(),
+            "10.0.0.249".to_string(),
+            crate::utils::db::current_timestamp(),
+        );
+        create_session(
+            &session_id,
+            &session,
+            &format!("mac-{}", vendo.vendo_id),
+            &format!("token-{}", vendo.vendo_id),
+        )
+        .unwrap();
+
+        let reservation =
+            reserve_vendo_for_customer_session(&vendo.vendo_id, &session_id).unwrap();
+
+        assert!(crate::routes::ws::state::unregister_vendo_connection(
+            &vendo.vendo_id,
+            generation,
+        ));
+        assert!(!crate::routes::ws::state::is_vendo_online(&vendo.vendo_id));
+
+        let assignment = existing_vendo_assignment(&session_id)
+            .unwrap()
+            .expect("Reconnect should preserve the reservation while the vendo is offline");
+
+        assert_eq!(assignment["type"], "VENDO_ASSIGNED");
+        assert_eq!(assignment["vendo_id"], reservation.vendo_id);
+        assert_eq!(assignment["vendo_name"], vendo.name);
+    }
+
+    #[test]
     fn browser_token_validation_requires_64_hex_characters() {
         assert!(valid_browser_token(&"a".repeat(64)));
         assert!(!valid_browser_token(&"a".repeat(63)));

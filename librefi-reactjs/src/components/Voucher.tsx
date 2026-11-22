@@ -15,7 +15,7 @@ function Voucher({
     onRedeemed,
     children
 }: {
-    onRedeemed: (browserToken?: string, redeemedCode?: string) => void;
+    onRedeemed: (browserToken?: string, redeemedCode?: string) => void | Promise<void>;
     children: ReactElement;
 }) {
     const [isOpen, setIsOpen] = useState(false);
@@ -72,7 +72,10 @@ function Voucher({
                     headers: {
                         "Content-Type": "application/json"
                     },
-                    body: JSON.stringify({ code: normalizedCode })
+                    body: JSON.stringify({
+                        code: normalizedCode,
+                        browser_token: localStorage.getItem("librefi_browser_token")
+                    })
                 });
 
                 if (!res.ok) {
@@ -91,7 +94,7 @@ function Voucher({
 
                 const json = await res.json();
 
-                onRedeemed(
+                await onRedeemed(
                     typeof json.browser_token === "string" ? json.browser_token : undefined,
                     normalizedCode
                 );
@@ -157,7 +160,7 @@ function Voucher({
 
                                 {recoveryStatus === false && (
                                     <p className="mt-2">
-                                        Your previous voucher could not be recovered. Your session has expired. Please purchase a new voucher or insert coins.
+                                        This voucher is not currently eligible for recovery. If you disconnected recently, wait until the seven-minute grace period has passed. If your session expired, purchase a new voucher or insert coins.
                                     </p>
                                 )}
                             </div>

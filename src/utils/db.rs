@@ -2497,6 +2497,49 @@ mod session_logic_tests {
             "Recovery must revoke the previous browser token"
         );
 
+        // A later coin payment must replace the redeemed retail voucher with
+        // the session's coin-generated recovery voucher.
+        let coin_recovery_session = {
+            let write_txn = get_db().begin_write().unwrap();
+            let (_, session, _) = credit_session_for_payment_in_transaction(
+                &write_txn,
+                "test-voucher-session",
+                None,
+                60,
+                None,
+            )
+            .unwrap();
+            write_txn.commit().unwrap();
+            session
+        };
+        let coin_recovery_code = coin_recovery_session
+            .recovery_voucher_code
+            .clone()
+            .expect("Voucher-to-coin payment must issue a coin recovery voucher");
+        assert_ne!(coin_recovery_code, "TESTVOUCHER1");
+        assert!(
+            redeem_voucher_for_customer_session("TESTVOUCHER1", None).is_err(),
+            "The redeemed retail voucher must be superseded by the coin recovery voucher"
+        );
+        let (_, repeated_coin_session, _) = {
+            let write_txn = get_db().begin_write().unwrap();
+            let result = credit_session_for_payment_in_transaction(
+                &write_txn,
+                "test-voucher-session",
+                None,
+                30,
+                None,
+            )
+            .unwrap();
+            write_txn.commit().unwrap();
+            result
+        };
+        assert_eq!(
+            repeated_coin_session.recovery_voucher_code.as_deref(),
+            Some(coin_recovery_code.as_str()),
+            "Later coin payments must reuse the current coin recovery voucher"
+        );
+
         // 5. An unused voucher after expiry must create a new session.
         let mut expired_voucher_session = Session::new(
             "Expired Voucher User".into(),

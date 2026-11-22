@@ -482,6 +482,113 @@ mod tests {
         }
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stress_test_100_concurrent_customer_websocket_connections() {
+        use crate::utils::db::{
+            create_session, current_timestamp, generate_browser_token, generate_secure_id,
+            init_test_db_once, Session,
+        };
+        use axum::routing::get;
+        use std::sync::{Arc, Barrier, mpsc};
+        use std::thread;
+        use tokio::net::TcpListener;
+        use tungstenite::Message;
+
+        init_test_db_once();
+
+        const CUSTOMER_COUNT: usize = 100;
+        let mut credentials = Vec::with_capacity(CUSTOMER_COUNT);
+
+        for index in 0..CUSTOMER_COUNT {
+            let session_id = generate_secure_id().unwrap();
+            let token = generate_browser_token().unwrap();
+            let mac = format!("02:00:00:00:{:02x}:{:02x}", index / 256, index % 256);
+            let session = Session::new(
+                format!("Load Test Customer {index}"),
+                "127.0.0.1".to_string(),
+                current_timestamp(),
+            );
+
+            create_session(&session_id, &session, &mac, &token).unwrap();
+            credentials.push(token);
+        }
+
+        let app = axum::Router::new().route("/ws", get(super::customer_ws_handler));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let barrier = Arc::new(Barrier::new(CUSTOMER_COUNT + 1));
+        let (result_tx, result_rx) = mpsc::channel();
+
+        let handles: Vec<_> = credentials
+            .into_iter()
+            .enumerate()
+            .map(|(index, token)| {
+                let barrier = Arc::clone(&barrier);
+                let result_tx = result_tx.clone();
+                let url = format!("ws://{address}/ws");
+
+                thread::spawn(move || {
+                    let result = (|| -> Result<(), String> {
+                        let (mut socket, _) =
+                            tungstenite::connect(url.as_str()).map_err(|e| e.to_string())?;
+                        let ack = serde_json::json!({
+                            "type": "ACK",
+                            "value": token,
+                        });
+                        socket
+                            .send(Message::Text(ack.to_string().into()))
+                            .map_err(|e| e.to_string())?;
+
+                        let response = socket.read().map_err(|e| e.to_string())?;
+                        match response {
+                            Message::Text(text) if text.contains("CUSTOMER_AUTH_OK") => Ok(()),
+                            other => Err(format!(
+                                "Customer {index} received unexpected response: {other:?}"
+                            )),
+                        }
+                    })();
+
+                    let _ = result_tx.send((index, result));
+                    // Keep successful connections open until all clients have
+                    // completed authentication, proving concurrency rather
+                    // than merely sequential connection success.
+                    barrier.wait();
+                })
+            })
+            .collect();
+
+        drop(result_tx);
+
+        let mut failures = Vec::new();
+        for _ in 0..CUSTOMER_COUNT {
+            match result_rx.recv_timeout(std::time::Duration::from_secs(30)) {
+                Ok((index, Ok(()))) => {}
+                Ok((index, Err(error))) => failures.push(format!("Customer {index}: {error}")),
+                Err(error) => failures.push(format!("Timed out waiting for customer result: {error}")),
+            }
+        }
+
+        barrier.wait();
+
+        for handle in handles {
+            if handle.join().is_err() {
+                failures.push("A customer client thread panicked".to_string());
+            }
+        }
+
+        server_task.abort();
+
+        assert!(
+            failures.is_empty(),
+            "100 concurrent customer WebSocket connections failed: {}",
+            failures.join("; ")
+        );
+    }
+
     #[test]
     fn customer_vendo_discovery_offers_a_choice_when_multiple_are_available() {
         match plan_vendo_discovery(vec![

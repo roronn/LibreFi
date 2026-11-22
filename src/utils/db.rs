@@ -33,6 +33,8 @@ pub struct Session {
     pub customer_id: Option<String>,
     #[serde(default)]
     pub expired_at: Option<u64>,
+    #[serde(default)]
+    pub recovery_voucher_code: Option<String>,
 }
 
 impl Session {
@@ -49,6 +51,7 @@ impl Session {
             disconnected_at: None,
             customer_id: None,
             expired_at: None,
+            recovery_voucher_code: None,
         }
     }
 
@@ -1411,7 +1414,7 @@ fn credit_session_for_payment_in_transaction(
     session.settle(now);
     ensure_customer_for_session(&write_txn, session_id, &mut session, now)?;
 
-    let (result_id, result_session, new_browser_token) = if session.expired_at.is_some() {
+    let (result_id, mut result_session, new_browser_token) = if session.expired_at.is_some() {
         let new_session_id = generate_secure_id()?;
         let browser_token = generate_browser_token()?;
         let token_hash = hash_recovery_token(&browser_token);
@@ -1494,6 +1497,75 @@ fn credit_session_for_payment_in_transaction(
 
         (session_id.to_string(), session, None)
     };
+
+    // Every customer who pays by coin receives one persistent recovery voucher
+    // per active session. The code is a bearer recovery credential, so it uses
+    // 80 bits of cryptographically secure randomness rather than the shorter
+    // six-character codes used for ordinary printed vouchers.
+    if result_session.recovery_voucher_code.is_none() {
+        let customer_id = result_session
+            .customer_id
+            .clone()
+            .ok_or_else(|| "Customer identity is missing for recovery voucher".to_string())?;
+
+        let mut vouchers = write_txn
+            .open_table(VOUCHERS_TABLE)
+            .map_err(|e| e.to_string())?;
+
+        let mut recovery_code = None;
+        for _ in 0..10 {
+            let random = generate_secure_id()?;
+            let code = format!(
+                "{}-{}-{}-{}-{}",
+                &random[0..4],
+                &random[4..8],
+                &random[8..12],
+                &random[12..16],
+                &random[16..20]
+            );
+
+            if vouchers
+                .get(code.as_str())
+                .map_err(|e| e.to_string())?
+                .is_none()
+            {
+                recovery_code = Some(code);
+                break;
+            }
+        }
+
+        let code = recovery_code
+            .ok_or_else(|| "Could not generate a unique recovery voucher".to_string())?;
+        let voucher = Voucher {
+            code: code.clone(),
+            price: 0.0,
+            time: 0,
+            used: true,
+            customer_id: Some(customer_id),
+            pdf_download_count: 0,
+            created_at: Some(now),
+            session_id: Some(result_id.clone()),
+            redeemed_at: Some(now),
+        };
+        let voucher_json = serde_json::to_string(&voucher).map_err(|e| e.to_string())?;
+        vouchers
+            .insert(code.as_str(), voucher_json.as_str())
+            .map_err(|e| e.to_string())?;
+
+        result_session.recovery_voucher_code = Some(code);
+        drop(vouchers);
+
+        // Persist the code on the session so later coin payments and reconnects
+        // return the same recovery credential instead of generating another.
+        let session_json =
+            serde_json::to_string(&result_session).map_err(|e| e.to_string())?;
+        let mut sessions = write_txn
+            .open_table(SESSIONS_TABLE)
+            .map_err(|e| e.to_string())?;
+        sessions
+            .insert(result_id.as_str(), session_json.as_str())
+            .map_err(|e| e.to_string())?;
+    }
 
     if let Some(amount) = sale_amount {
         let local_time = now + 8 * 3600;

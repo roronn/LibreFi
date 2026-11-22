@@ -2528,4 +2528,105 @@ mod session_logic_tests {
             )
         );
     }
+
+    #[test]
+    fn concurrent_reservations_are_exclusive_per_vendo_and_session() {
+        init_test_db_once();
+
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let (vendo, _) = register_vendo("Reservation Race Test").unwrap();
+        let generation = crate::routes::ws::state::register_vendo_connection(&vendo.vendo_id);
+
+        let session_one = generate_secure_id().unwrap();
+        let session_two = generate_secure_id().unwrap();
+
+        let mut first = Session::new("Reservation Customer One".into(), "10.0.0.31".into(), current_timestamp());
+        first.remaining_seconds = 120;
+        first.paused = true;
+        create_session(
+            &session_one,
+            &first,
+            &format!("mac-{}", session_one),
+            &format!("token-{}", session_one),
+        ).unwrap();
+
+        let mut second = Session::new("Reservation Customer Two".into(), "10.0.0.32".into(), current_timestamp());
+        second.remaining_seconds = 120;
+        second.paused = true;
+        create_session(
+            &session_two,
+            &second,
+            &format!("mac-{}", session_two),
+            &format!("token-{}", session_two),
+        ).unwrap();
+
+        let barrier = Arc::new(Barrier::new(3));
+        let vendo_one = vendo.vendo_id.clone();
+        let session_one_for_thread = session_one.clone();
+        let barrier_one = Arc::clone(&barrier);
+        let first_attempt = thread::spawn(move || {
+            barrier_one.wait();
+            reserve_vendo_for_customer_session(&vendo_one, &session_one_for_thread)
+        });
+
+        let vendo_two = vendo.vendo_id.clone();
+        let session_two_for_thread = session_two.clone();
+        let barrier_two = Arc::clone(&barrier);
+        let second_attempt = thread::spawn(move || {
+            barrier_two.wait();
+            reserve_vendo_for_customer_session(&vendo_two, &session_two_for_thread)
+        });
+
+        barrier.wait();
+
+        let first_result = first_attempt.join().unwrap();
+        let second_result = second_attempt.join().unwrap();
+
+        assert_ne!(
+            first_result.is_ok(),
+            second_result.is_ok(),
+            "Exactly one customer must reserve a vendo when requests race"
+        );
+
+        let winning_session = if first_result.is_ok() {
+            session_one.as_str()
+        } else {
+            session_two.as_str()
+        };
+
+        let stored = get_vendo_reservation_for_vendo(&vendo.vendo_id)
+            .unwrap()
+            .expect("The winning reservation must be stored");
+        assert_eq!(stored.session_id, winning_session);
+
+        // A session that already owns one reservation cannot reserve another vendo.
+        let (second_vendo, _) = register_vendo("Second Reservation Race Test").unwrap();
+        let second_generation =
+            crate::routes::ws::state::register_vendo_connection(&second_vendo.vendo_id);
+
+        assert!(
+            reserve_vendo_for_customer_session(&second_vendo.vendo_id, winning_session).is_err(),
+            "A customer session must not reserve two vendos"
+        );
+
+        assert!(
+            get_vendo_reservation_for_vendo(&second_vendo.vendo_id)
+                .unwrap()
+                .is_none()
+        );
+
+        assert!(release_vendo_reservation_for_session(winning_session).unwrap());
+
+        assert!(crate::routes::ws::state::unregister_vendo_connection(
+            &vendo.vendo_id,
+            generation,
+        ));
+        assert!(crate::routes::ws::state::unregister_vendo_connection(
+            &second_vendo.vendo_id,
+            second_generation,
+        ));
+    }
+
 }

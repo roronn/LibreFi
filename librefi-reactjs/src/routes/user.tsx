@@ -33,7 +33,9 @@ function User() {
                 localStorage.setItem("librefi_browser_token", keyToken);
             }
         } catch {
-            // A valid browser token remains an accepted fallback.
+            // If the key exists but cannot be checked and no token remains,
+            // do not silently create a different session.
+            if (!savedToken) return;
         }
 
         const params = new URLSearchParams({ _: String(Date.now()) });

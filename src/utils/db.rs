@@ -30,6 +30,8 @@ pub struct Session {
     pub wifi_connected: bool,
     pub disconnected_at: Option<u64>,
     #[serde(default)]
+    pub customer_id: Option<String>,
+    #[serde(default)]
     pub expired_at: Option<u64>,
 }
 
@@ -45,6 +47,7 @@ impl Session {
             pause_day: (now / 86400) as u32,
             wifi_connected: true,
             disconnected_at: None,
+            customer_id: None,
             expired_at: None,
         }
     }
@@ -115,6 +118,13 @@ impl Session {
         copy.settle(now);
         copy.remaining_seconds
     }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct Customer {
+    pub customer_id: String,
+    pub created_at: u64,
+    pub active_session_id: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -193,6 +203,8 @@ pub const DEVICE_SESSIONS_TABLE: TableDefinition<&str, &str> =
     TableDefinition::new("device_sessions");
 pub const BROWSER_TOKENS_TABLE: TableDefinition<&str, &str> =
     TableDefinition::new("browser_tokens");
+pub const CUSTOMERS_TABLE: TableDefinition<&str, &str> =
+    TableDefinition::new("customers");
 
 // Multi-vendo registry and payment tables
 pub const VENDOS_TABLE: TableDefinition<&str, &str> = TableDefinition::new("vendos");
@@ -226,6 +238,7 @@ pub fn init_db(db_path: &str) {
         let _ = write_txn.open_table(SESSIONS_TABLE).unwrap();
         let _ = write_txn.open_table(DEVICE_SESSIONS_TABLE).unwrap();
         let _ = write_txn.open_table(BROWSER_TOKENS_TABLE).unwrap();
+        let _ = write_txn.open_table(CUSTOMERS_TABLE).unwrap();
 
         // Multi-vendo tables
         let _ = write_txn.open_table(VENDOS_TABLE).unwrap();
@@ -371,6 +384,50 @@ pub fn register_vendo(name: &str) -> Result<(Vendo, String), String> {
     Ok((vendo, device_credential))
 }
 
+fn ensure_customer_for_session(
+    write_txn: &redb::WriteTransaction,
+    session_id: &str,
+    session: &mut Session,
+    now: u64,
+) -> Result<(), String> {
+    let customer_id = match session.customer_id.clone() {
+        Some(id) if !id.is_empty() => id,
+        _ => generate_secure_id()?,
+    };
+
+    let mut customers = write_txn
+        .open_table(CUSTOMERS_TABLE)
+        .map_err(|e| e.to_string())?;
+
+    let customer = match customers
+        .get(customer_id.as_str())
+        .map_err(|e| e.to_string())?
+    {
+        Some(value) => {
+            let mut record: Customer =
+                serde_json::from_str(value.value()).map_err(|e| e.to_string())?;
+            if record.customer_id != customer_id {
+                return Err("Customer record ID mismatch".to_string());
+            }
+            record.active_session_id = session_id.to_string();
+            record
+        }
+        None => Customer {
+            customer_id: customer_id.clone(),
+            created_at: now,
+            active_session_id: session_id.to_string(),
+        },
+    };
+
+    let customer_json = serde_json::to_string(&customer).map_err(|e| e.to_string())?;
+    customers
+        .insert(customer_id.as_str(), customer_json.as_str())
+        .map_err(|e| e.to_string())?;
+
+    session.customer_id = Some(customer_id);
+    Ok(())
+}
+
 pub fn create_session(
     session_id: &str,
     session: &Session,
@@ -380,7 +437,9 @@ pub fn create_session(
     let db = get_db();
     let write_txn = db.begin_write().map_err(|e| e.to_string())?;
     let token_hash = hash_recovery_token(browser_token);
-    let session_json = serde_json::to_string(session).map_err(|e| e.to_string())?;
+    let mut session_record = session.clone();
+    ensure_customer_for_session(&write_txn, session_id, &mut session_record, current_timestamp())?;
+    let session_json = serde_json::to_string(&session_record).map_err(|e| e.to_string())?;
 
     {
         let mut sessions = write_txn
@@ -1083,6 +1142,7 @@ fn credit_session_for_payment_in_transaction(
     };
 
     session.settle(now);
+    ensure_customer_for_session(&write_txn, session_id, &mut session, now)?;
 
     let (result_id, result_session, new_browser_token) = if session.expired_at.is_some() {
         let new_session_id = generate_secure_id()?;
@@ -1090,6 +1150,8 @@ fn credit_session_for_payment_in_transaction(
         let token_hash = hash_recovery_token(&browser_token);
 
         let mut new_session = Session::new(session.name.clone(), session.ip.clone(), now);
+        new_session.customer_id = session.customer_id.clone();
+        ensure_customer_for_session(&write_txn, &new_session_id, &mut new_session, now)?;
         new_session.remaining_seconds = seconds;
         new_session.last_accounted_at = now;
 
@@ -1537,6 +1599,8 @@ pub struct Voucher {
     pub time: u32,
     pub used: bool,
     #[serde(default)]
+    pub customer_id: Option<String>,
+    #[serde(default)]
     pub pdf_download_count: u32,
     #[serde(default)]
     pub created_at: Option<u64>,
@@ -1588,6 +1652,16 @@ pub fn redeem_voucher_for_session(
 
             serde_json::from_str::<Session>(value.value()).map_err(|e| e.to_string())?
         };
+
+        // A used voucher is permanently tied to the customer who first redeemed it.
+        ensure_customer_for_session(&write_txn, session_id.as_str(), &mut session, now)?;
+        let voucher_customer_id = voucher
+            .customer_id
+            .as_deref()
+            .ok_or_else(|| "Used voucher has no registered customer identity".to_string())?;
+        if session.customer_id.as_deref() != Some(voucher_customer_id) {
+            return Err("Voucher belongs to a different customer".to_string());
+        }
 
         // Settle the original session before deciding whether recovery is allowed.
         session.settle(now);
@@ -1656,6 +1730,7 @@ pub fn redeem_voucher_for_session(
     };
 
     session.settle(now);
+    ensure_customer_for_session(&write_txn, session_id.as_str(), &mut session, now)?;
 
     let (credited_session_id, credited_session, new_browser_token) = if session.expired_at.is_some()
     {
@@ -1665,6 +1740,8 @@ pub fn redeem_voucher_for_session(
         let token_hash = hash_recovery_token(&browser_token);
 
         let mut new_session = Session::new(session.name.clone(), session.ip.clone(), now);
+        new_session.customer_id = session.customer_id.clone();
+        ensure_customer_for_session(&write_txn, &new_session_id, &mut new_session, now)?;
         new_session.remaining_seconds = voucher.time as u64;
         new_session.last_accounted_at = now;
 
@@ -1783,6 +1860,7 @@ pub fn redeem_voucher_for_session(
     }
 // Associate the voucher with the session that actually received its time.
     voucher.used = true;
+    voucher.customer_id = credited_session.customer_id.clone();
     voucher.session_id = Some(credited_session_id.clone());
     voucher.redeemed_at = Some(now);
 
@@ -1891,6 +1969,7 @@ mod session_logic_tests {
             price: 10.0,
             time: 300,
             used: false,
+            customer_id: None,
             pdf_download_count: 0,
             created_at: Some(now),
             session_id: None,
@@ -1945,6 +2024,7 @@ mod session_logic_tests {
             price: 10.0,
             time: 600,
             used: false,
+            customer_id: None,
             pdf_download_count: 0,
             created_at: Some(now),
             session_id: None,

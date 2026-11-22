@@ -167,3 +167,111 @@ fn test_post_coinslot_key() {
     let url = format!("{}/api/admin/coinslot/key", BASE_URL);
     let _response = ureq::post(&url).send_json(json!({"payload": payload}));
 }
+
+#[test]
+fn test_admin_vendo_management_lifecycle() {
+    let base_url = format!("{}/api/admin/vendos", BASE_URL);
+
+    // Register a new vendo and capture its one-time credential.
+    let create_payload = encrypt_payload(
+        &admin_key(),
+        json!({"name": format!("API Test Vendo {}", rand::random::<u32>())}),
+    );
+    let create_response = ureq::post(&base_url)
+        .send_json(json!({"payload": create_payload}))
+        .expect("Failed to register vendo");
+    assert_eq!(create_response.status(), 201);
+
+    let created: serde_json::Value = create_response
+        .into_json()
+        .expect("Invalid registration response");
+    assert_eq!(created["ok"], true);
+    let vendo_id = created["vendo"]["vendo_id"]
+        .as_str()
+        .expect("Registration response missing vendo_id")
+        .to_string();
+    let original_credential = created["credential"]
+        .as_str()
+        .expect("Registration response missing one-time credential")
+        .to_string();
+    assert!(!original_credential.is_empty());
+
+    // The list endpoint must report the vendo without exposing its credential.
+    let list_payload = encrypt_payload(&admin_key(), json!({"id": 1}));
+    let list_url = format!(
+        "{}?payload={}",
+        base_url,
+        query_string(&list_payload)
+    );
+    let list_response = ureq::get(&list_url)
+        .call()
+        .expect("Failed to list vendos");
+    let listed: serde_json::Value = list_response
+        .into_json()
+        .expect("Invalid vendo list response");
+    let entry = listed["vendos"]
+        .as_array()
+        .and_then(|items| items.iter().find(|item| item["vendo_id"] == vendo_id))
+        .expect("New vendo was not returned by list endpoint");
+    assert_eq!(entry["credential_active"], true);
+    assert!(entry.get("credential").is_none());
+
+    // Disable and re-enable the vendo.
+    for enabled in [false, true] {
+        let payload = encrypt_payload(
+            &admin_key(),
+            json!({"vendo_id": vendo_id, "enabled": enabled}),
+        );
+        let response = ureq::put(&base_url)
+            .send_json(json!({"payload": payload}))
+            .expect("Failed to update vendo enabled state");
+        assert_eq!(response.status(), 200);
+    }
+
+    // Rotation returns a different one-time credential.
+    let rotate_payload = encrypt_payload(
+        &admin_key(),
+        json!({"vendo_id": vendo_id}),
+    );
+    let rotate_response = ureq::post(&format!("{}/rotate", base_url))
+        .send_json(json!({"payload": rotate_payload}))
+        .expect("Failed to rotate vendo credential");
+    assert_eq!(rotate_response.status(), 200);
+    let rotated: serde_json::Value = rotate_response
+        .into_json()
+        .expect("Invalid credential rotation response");
+    let rotated_credential = rotated["credential"]
+        .as_str()
+        .expect("Rotation response missing credential");
+    assert_ne!(rotated_credential, original_credential);
+
+    // Revoke the rotated credential.
+    let revoke_payload = encrypt_payload(
+        &admin_key(),
+        json!({"vendo_id": vendo_id}),
+    );
+    let revoke_response = ureq::post(&format!("{}/revoke", base_url))
+        .send_json(json!({"payload": revoke_payload}))
+        .expect("Failed to revoke vendo credential");
+    assert_eq!(revoke_response.status(), 200);
+
+    // A final list confirms that the credential is no longer active.
+    let final_payload = encrypt_payload(&admin_key(), json!({"id": 1}));
+    let final_url = format!(
+        "{}?payload={}",
+        base_url,
+        query_string(&final_payload)
+    );
+    let final_response = ureq::get(&final_url)
+        .call()
+        .expect("Failed to list vendos after revocation");
+    let final_list: serde_json::Value = final_response
+        .into_json()
+        .expect("Invalid final vendo list response");
+    let final_entry = final_list["vendos"]
+        .as_array()
+        .and_then(|items| items.iter().find(|item| item["vendo_id"] == vendo_id))
+        .expect("Vendo disappeared after credential revocation");
+    assert_eq!(final_entry["credential_active"], false);
+}
+

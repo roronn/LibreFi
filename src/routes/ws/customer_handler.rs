@@ -155,8 +155,15 @@ async fn handle_customer_socket(mut socket: WebSocket) {
         return;
     }
 
+    let (customer_tx, mut customer_rx) = tokio::sync::mpsc::unbounded_channel();
+    let connection_id = crate::routes::ws::state::register_customer_connection(
+        &session_id,
+        customer_tx,
+    );
+
     loop {
-        match socket.recv().await {
+        tokio::select! {
+            incoming = socket.recv() => match incoming {
             Some(Ok(Message::Ping(payload))) => {
                 if socket.send(Message::Pong(payload)).await.is_err() {
                     break;
@@ -248,9 +255,24 @@ async fn handle_customer_socket(mut socket: WebSocket) {
             Some(Ok(_)) => {
                 close_socket(&mut socket).await;
                 break;
+            },
+            notification = customer_rx.recv() => {
+                match notification {
+                    Some(value) => {
+                        if send_json(&mut socket, value).await.is_err() {
+                            break;
+                        }
+                    }
+                    None => break,
+                }
             }
         }
     }
+
+    crate::routes::ws::state::unregister_customer_connection(
+        &session_id,
+        connection_id,
+    );
 }
 
 #[cfg(test)]

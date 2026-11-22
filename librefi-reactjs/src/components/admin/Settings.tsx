@@ -14,12 +14,9 @@ export default function AdminSettings() {
         ssid_2g: "", key_2g: "", disabled_2g: false, supports_2g: true,
         ssid_5g: "", key_5g: "", disabled_5g: false, supports_5g: false
     });
-    const [coinslot, setCoinslot] = useState({ prefix: "", generated_at: "" });
-    const [newCoinslotKey, setNewCoinslotKey] = useState("");
 
     const [loadingQos, setLoadingQos] = useState(false);
     const [loadingWifi, setLoadingWifi] = useState(false);
-    const [loadingCoinslot, setLoadingCoinslot] = useState(false);
 
     async function loadSettings() {
         const key = getAdminKey();
@@ -42,11 +39,6 @@ export default function AdminSettings() {
             setWifi(data);
         }
 
-        const resCoinslot = await fetch(`/api/admin/coinslot-key?payload=${encodeURIComponent(payload || "")}`);
-        if (resCoinslot.ok) {
-            const data = await resCoinslot.json();
-            setCoinslot(data);
-        }
     }
 
     useEffect(() => {
@@ -79,23 +71,6 @@ export default function AdminSettings() {
             toast.error("Error", { position: "top-center", description: "Failed to update WiFi configuration." });
         }
         setLoadingWifi(false);
-    }
-
-    async function generateCoinslotKey() {
-        setLoadingCoinslot(true);
-        const res = await fetch("/api/admin/coinslot-key", {
-            method: "POST",
-            body: JSON.stringify({ payload: await encrypt(getAdminKey(), JSON.stringify({ action: "generate" })) })
-        });
-        if (res.ok) {
-            const data = await res.json();
-            setNewCoinslotKey(data.key);
-            toast.success("Success", { position: "top-center", description: "New Coinslot Key generated." });
-            loadSettings();
-        } else {
-            toast.error("Error", { position: "top-center", description: "Failed to generate Coinslot Key." });
-        }
-        setLoadingCoinslot(false);
     }
 
     return (
@@ -233,45 +208,7 @@ export default function AdminSettings() {
                 )}
             </div>
 
-            <div className="border border-border p-6 rounded-xl flex flex-col gap-4">
-                <div>
-                    <h2 className="text-lg font-semibold text-amber-500">Coinslot Authentication Key</h2>
-                    <p className="text-sm text-foreground/60">Generate a new cryptographic key for your ESP8266 Coinslot module. This will invalidate the old key.</p>
-                </div>
 
-                <div className="bg-foreground/2 p-4 rounded-md">
-                    <p className="text-sm font-medium">Current Key Prefix: <span className="font-mono text-primary">{coinslot.prefix || "None"}</span></p>
-                    {coinslot.generated_at && <p className="text-xs text-foreground/60 mt-1">Generated at: {new Date(parseInt(coinslot.generated_at) * 1000).toLocaleString()}</p>}
-                </div>
-
-                {newCoinslotKey && (
-                    <div className="bg-emerald-100/10 border border-emerald-300/20 p-4 rounded-md">
-                        <p className="text-sm font-semibold text-emerald-500 mb-2">New Key Generated (Save this, it won't be shown again):</p>
-                        <p className="font-mono text-lg text-emerald-600 break-all select-all">{newCoinslotKey}</p>
-                    </div>
-                )}
-
-                <div className="flex justify-end mt-2">
-                    <Dialog>
-                        <DialogTrigger render={<Button disabled={loadingCoinslot} variant="destructive">
-                            {loadingCoinslot ? <Loader2 className="animate-spin mr-2" size={16} /> : null}
-                            Generate New Key
-                        </Button>}></DialogTrigger>
-                        <DialogContent>
-                            <DialogHeader>
-                                <DialogTitle>Generate New Coinslot Key?</DialogTitle>
-                                <DialogDescription>
-                                    This action will permanently invalidate your current coinslot module key, and it will stop working until you reset it and apply the new key.
-                                </DialogDescription>
-                            </DialogHeader>
-                            <DialogFooter>
-                                <DialogClose render={<Button variant="outline">Cancel</Button>}></DialogClose>
-                                <DialogClose render={<Button variant="destructive" onClick={generateCoinslotKey}>Generate</Button>}></DialogClose>
-                            </DialogFooter>
-                        </DialogContent>
-                    </Dialog>
-                </div>
-            </div>
         </div>
     );
 }

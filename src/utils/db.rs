@@ -1152,6 +1152,89 @@ pub fn settle_and_get_session(session_id: &str, now: u64) -> Result<Option<Sessi
 
     Ok(Some(session))
 }
+/// Persist customer WebSocket connectivity so voucher recovery can enforce
+/// the seven-minute disconnect grace period.
+pub fn set_session_wifi_connected(session_id: &str, connected: bool) -> Result<(), String> {
+    let db = get_db();
+    let write_txn = db.begin_write().map_err(|error| error.to_string())?;
+    let now = current_timestamp();
+
+    let mut session = {
+        let sessions = write_txn
+            .open_table(SESSIONS_TABLE)
+            .map_err(|error| error.to_string())?;
+        let value = sessions
+            .get(session_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "Customer session not found".to_string())?;
+        serde_json::from_str::<Session>(value.value()).map_err(|error| error.to_string())?
+    };
+
+    session.set_wifi_connected(connected, now);
+    let session_json = serde_json::to_string(&session).map_err(|error| error.to_string())?;
+    {
+        let mut sessions = write_txn
+            .open_table(SESSIONS_TABLE)
+            .map_err(|error| error.to_string())?;
+        sessions
+            .insert(session_id, session_json.as_str())
+            .map_err(|error| error.to_string())?;
+    }
+
+    write_txn.commit().map_err(|error| error.to_string())
+}
+
+/// A process restart drops all in-memory WebSocket connections. Mark any
+/// persisted connected sessions disconnected at startup, beginning a fresh
+/// grace window without charging time while the server was offline.
+pub fn mark_all_customer_sessions_disconnected() -> Result<(), String> {
+    let db = get_db();
+    let write_txn = db.begin_write().map_err(|error| error.to_string())?;
+    let now = current_timestamp();
+
+    let updates = {
+        let sessions = write_txn
+            .open_table(SESSIONS_TABLE)
+            .map_err(|error| error.to_string())?;
+        sessions
+            .iter()
+            .map_err(|error| error.to_string())?
+            .map(|entry| {
+                let (key, value) = entry.map_err(|error| error.to_string())?;
+                let session: Session =
+                    serde_json::from_str(value.value()).map_err(|error| error.to_string())?;
+                Ok(if session.wifi_connected {
+                    let mut disconnected = session;
+                    disconnected.wifi_connected = false;
+                    disconnected.disconnected_at = Some(now);
+                    disconnected.last_accounted_at = now;
+                    Some((key.value().to_string(), disconnected))
+                } else {
+                    None
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+    };
+
+    {
+        let mut sessions = write_txn
+            .open_table(SESSIONS_TABLE)
+            .map_err(|error| error.to_string())?;
+        for (session_id, session) in updates {
+            let session_json =
+                serde_json::to_string(&session).map_err(|error| error.to_string())?;
+            sessions
+                .insert(session_id.as_str(), session_json.as_str())
+                .map_err(|error| error.to_string())?;
+        }
+    }
+
+    write_txn.commit().map_err(|error| error.to_string())
+}
+
 pub fn credit_session_for_payment(
     session_id: &str,
     mac: &str,

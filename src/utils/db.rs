@@ -1788,14 +1788,8 @@ pub struct Voucher {
 /// seven-minute disconnect grace period. MAC addresses are not identity.
 pub fn redeem_voucher_for_customer_session(
     code: &str,
-    browser_token: &str,
+    browser_token: Option<&str>,
 ) -> Result<(String, Session, bool, Option<String>), String> {
-    if browser_token.len() != 64
-        || !browser_token.bytes().all(|byte| byte.is_ascii_hexdigit())
-    {
-        return Err("A valid browser token is required".to_string());
-    }
-
     let db = get_db();
     let write_txn = db.begin_write().map_err(|error| error.to_string())?;
     let now = current_timestamp();
@@ -1886,6 +1880,13 @@ pub fn redeem_voucher_for_customer_session(
 
     // An unused voucher is claimed only by the browser token already bound
     // to the customer session. A MAC address cannot claim or select a session.
+    let browser_token = browser_token
+        .ok_or_else(|| "A valid browser token is required".to_string())?;
+    if browser_token.len() != 64
+        || !browser_token.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err("A valid browser token is required".to_string());
+    }
     let token_hash = hash_recovery_token(browser_token);
     let session_id = {
         let tokens = write_txn

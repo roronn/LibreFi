@@ -268,6 +268,12 @@ pub fn unregister_vendo_connection(vendo_id: &str, generation: u64) -> bool {
 pub fn is_vendo_online(vendo_id: &str) -> bool {
     VENDO_CONNECTIONS.lock().unwrap().contains_key(vendo_id)
 }
+
+// Invalidates the current authenticated connection. The handler's generation
+// check rejects subsequent messages from the old socket.
+pub fn invalidate_vendo_connection(vendo_id: &str) -> bool {
+    VENDO_CONNECTIONS.lock().unwrap().remove(vendo_id).is_some()
+}
 // Runs an operation while the vendo's authenticated connection remains locked.
 pub fn with_vendo_online<T>(
     vendo_id: &str,

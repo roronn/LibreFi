@@ -768,7 +768,7 @@ pub fn reserve_vendo_for_session(
             }
         }
 
-        {
+        if !mac.is_empty() {
             let devices = write_txn
                 .open_table(DEVICE_SESSIONS_TABLE)
                 .map_err(|e| e.to_string())?;
@@ -813,6 +813,15 @@ pub fn reserve_vendo_for_session(
                 return Err("Vendo is already reserved".to_string());
             }
 
+            for entry in reservations.iter().map_err(|e| e.to_string())? {
+                let (_, value) = entry.map_err(|e| e.to_string())?;
+                let existing: VendoReservation =
+                    serde_json::from_str(value.value()).map_err(|e| e.to_string())?;
+                if existing.session_id == session_id {
+                    return Err("Customer session already has a vendo reservation".to_string());
+                }
+            }
+
             let reservation_json =
                 serde_json::to_string(&reservation).map_err(|e| e.to_string())?;
 
@@ -831,6 +840,15 @@ pub fn reserve_vendo_for_session(
         None => Err("Vendo is offline".to_string()),
     }
 }
+/// Reserve a vendo for a customer authenticated by its browser token.
+/// The session ID is the reservation owner; a client MAC is not required.
+pub fn reserve_vendo_for_customer_session(
+    vendo_id: &str,
+    session_id: &str,
+) -> Result<VendoReservation, String> {
+    reserve_vendo_for_session(vendo_id, session_id, "")
+}
+
 pub fn set_vendo_enabled(vendo_id: &str, enabled: bool) -> Result<Vendo, String> {
     let db = get_db();
     let write_txn = db.begin_write().map_err(|e| e.to_string())?;
@@ -876,7 +894,9 @@ pub fn release_vendo_reservation(
         let reservation: VendoReservation =
             serde_json::from_str(value.value()).map_err(|e| e.to_string())?;
 
-        if reservation.session_id == session_id && reservation.mac == mac {
+        if reservation.session_id == session_id
+            && (mac.is_empty() || reservation.mac == mac)
+        {
             matching_vendo_ids.push(key.value().to_string());
         }
     }
@@ -893,6 +913,11 @@ pub fn release_vendo_reservation(
 
     Ok(!matching_vendo_ids.is_empty())
 }
+/// Release a reservation using the authenticated customer session ID.
+pub fn release_vendo_reservation_for_session(session_id: &str) -> Result<bool, String> {
+    release_vendo_reservation(session_id, "")
+}
+
 pub fn get_vendo_reservation_for_session(
     session_id: &str,
 ) -> Result<Option<VendoReservation>, String> {
@@ -1358,7 +1383,6 @@ pub fn credit_vendo_payment(
 
         if reservation.vendo_id != event.vendo_id
             || reservation.session_id != session_id
-            || reservation.mac != mac
         {
             return Err("Vendo reservation does not belong to this session".to_string());
         }

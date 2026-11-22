@@ -397,7 +397,8 @@ function Coin({ children, onClose }: { children: ReactElement, onClose?: () => v
                                             toast.success("Demo coin accepted", {
                                                 description: `₱${result.amount} credited to this customer session.`,
                                                 position: "top-center"
-                                            });                                            const customerSocket = wsRef.current;
+                                            });
+                                            const customerSocket = wsRef.current;
                                             if (customerSocket?.readyState === WebSocket.OPEN) {
                                                 setIsAwaitingReservation(true);
                                                 customerSocket.send(JSON.stringify({ type: "REQUEST_VENDO" }));
